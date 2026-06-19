@@ -1,0 +1,27 @@
+[project]
+name = "bagfd"
+version = "0.1.0"
+description = "Blue Archive Game Files Downloader"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "platformdirs>=4",
+    "requests>=2.32.5",
+    "tqdm>=4",
+    "xxhash>=3.6.0",
+]
+
+[project.scripts]
+bagfd = "bagfd.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bagfd"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
