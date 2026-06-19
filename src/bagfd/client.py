@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import zipfile
 from pathlib import Path
 
@@ -84,6 +85,10 @@ class BlueArchiveGameFilesDownloader:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         init_database(self.db_path)
 
+        self._update_locks: dict[str, threading.Lock] = {
+            p: threading.Lock() for p in _ALL_PLATFORMS
+        }
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -93,6 +98,7 @@ class BlueArchiveGameFilesDownloader:
         pattern: str,
         platform: Platform,
         filter_method: FilterMethod = FilterMethod.AUTO,
+        update_background: bool = False,
     ) -> list[FileInfo]:
         """Search the catalog for files matching ``pattern`` on ``platform``.
 
@@ -103,6 +109,12 @@ class BlueArchiveGameFilesDownloader:
             pattern: Filename pattern.
             platform: A single platform (``all`` is not accepted).
             filter_method: Matching strategy (see `FilterMethod`).
+            update_background: If True, a due catalog refresh is kicked off on
+                a daemon thread instead of blocking this call. The query then
+                runs against whatever is currently in the catalog — possibly
+                stale, or empty if this platform has never been fetched. At
+                most one background refresh runs per platform at a time;
+                redundant calls while one is in flight are skipped.
 
         Returns:
             A `FileInfo` per matching bundle file.
@@ -111,7 +123,7 @@ class BlueArchiveGameFilesDownloader:
             ValueError: If ``platform`` is not one of the three platforms.
         """
         platform = self._validate_platform(platform)
-        self._ensure_fresh(platform)
+        self._ensure_fresh(platform, background=update_background)
         f = FileFilter(pattern, filter_method)
         return self._query_platform(f, platform)
 
@@ -313,10 +325,34 @@ class BlueArchiveGameFilesDownloader:
         results = fetch_japan_servers(self.session, self.db_path, force)
         return bool(results.get(platform))
 
-    def _ensure_fresh(self, platform: str, cache_dir: Path | None = None) -> None:
+    def _ensure_fresh(self, platform: str, cache_dir: Path | None = None, background: bool = False) -> None:
         """Refresh the catalog if due, invalidating caches on a new version."""
+        if background:
+            self._ensure_fresh_background(platform, cache_dir)
+            return
         if self._fetch_platform(platform, force=False):
             self._invalidate(platform, cache_dir)
+
+    def _ensure_fresh_background(self, platform: str, cache_dir: Path | None = None) -> None:
+        """Refresh the catalog on a daemon thread; returns immediately.
+
+        Skips starting a new thread if a refresh for ``platform`` is already
+        in flight, so repeated calls don't pile up redundant fetches.
+        """
+        lock = self._update_locks[platform]
+        if not lock.acquire(blocking=False):
+            return
+
+        def run() -> None:
+            try:
+                if self._fetch_platform(platform, force=False):
+                    self._invalidate(platform, cache_dir)
+            except Exception:
+                logger.exception(f"Background catalog update failed for {platform}")
+            finally:
+                lock.release()
+
+        threading.Thread(target=run, name=f"bagfd-update-{platform}", daemon=True).start()
 
     def _invalidate(self, platform: str, cache_dir: Path | None = None) -> None:
         """Clear cached files for ``platform`` across all cache locations."""
