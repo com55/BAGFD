@@ -1,6 +1,6 @@
-# bagfd
+# BAGFD
 
-Blue Archive Game Files Downloader — Python port of [BA-AD](https://github.com/Deathemonic/BA-AD).
+Blue Archive Game Files Downloader — inspired by / based on [BA-AD](https://github.com/Deathemonic/BA-AD).
 
 Downloads game bundle files from Blue Archive servers across 3 platforms:
 - Global Android
@@ -100,7 +100,14 @@ client.update(platform=Platform.GLOBAL_ANDROID)
 ```python
 files = client.query('ch0230', platform=Platform.GLOBAL_ANDROID)
 files = client.query('*.bundle', platform='global-android', filter_method='glob')
+
+# Non-blocking: query whatever is in the catalog now, refresh in the background
+files = client.query('ch0230', platform=Platform.GLOBAL_ANDROID, update_background=True)
 ```
+
+`update_background=True` kicks a due catalog refresh onto a daemon thread instead
+of blocking the call — the query runs against the current (possibly stale, or
+empty) catalog. At most one background refresh runs per platform at a time.
 
 `query` returns `list[FileInfo]`. The fields differ by platform:
 
@@ -198,3 +205,15 @@ by default, or `$BAGFD_DATA_DIR`, or the `data_dir=` constructor argument):
 | `data_dir/zip_cache/<platform>/` | cached Japan zip packs (shared by `download` and `get_latest_files`) |
 | `data_dir/download_cache/<platform>/` | default cache for `get_latest_files` |
 | `./download` (or your `output_dir`) | files delivered by `download` |
+
+## Acknowledgement
+
+- [Deathemonic/BA-AD](https://github.com/Deathemonic/BA-AD) — the project this one is based on.
+
+## Copyright
+
+Blue Archive is a registered trademark of NAT GAMES Co., Ltd., NEXON Korea Corp., and Yostar, Inc.
+This project is not affiliated with, endorsed by, or connected to NAT GAMES Co., Ltd., NEXON Korea
+Corp., NEXON GAMES Co., Ltd., IODivision, Yostar, Inc., or any of their subsidiaries or affiliates.
+All game assets, content, and materials are copyrighted by their respective owners and are used for
+informational and educational purposes only.
