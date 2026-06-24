@@ -65,9 +65,19 @@ def init_database(db_path: Path) -> None:
             platform TEXT PRIMARY KEY,
             version TEXT NOT NULL,
             last_check TIMESTAMP NOT NULL,
-            last_update TIMESTAMP NOT NULL
+            last_update TIMESTAMP NOT NULL,
+            defer_until TIMESTAMP
         )
     """)
+
+    # Migration: add defer_until to databases created before it existed.
+    # CREATE TABLE IF NOT EXISTS won't add a column to a pre-existing table,
+    # so ALTER it in. Idempotent — the OperationalError fires once the column
+    # is already present (fresh DBs created by the statement above).
+    try:
+        cursor.execute("ALTER TABLE versions ADD COLUMN defer_until TIMESTAMP")
+    except sqlite3.OperationalError:
+        pass
 
     # Create separate tables for each platform. `path` is the primary key — no
     # surrogate id / AUTOINCREMENT, so nothing climbs across catalog refreshes.
@@ -125,15 +135,21 @@ def should_check_version(db_path: Path, platform: str, force: bool = False,
     
     conn = _connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT last_check FROM versions WHERE platform = ?", (platform,))
+    cursor.execute("SELECT last_check, defer_until FROM versions WHERE platform = ?", (platform,))
     result = cursor.fetchone()
     conn.close()
-    
+
     if not result:
         return True
-    
-    last_check = datetime.fromisoformat(result[0])
-    return datetime.now() - last_check > check_interval
+
+    last_check, defer_until = result
+    # A failed catalog fetch parks a short defer window here so we keep serving
+    # the cached catalog instead of hammering a server that's down for
+    # maintenance. Honour it before the normal interval check.
+    if defer_until and datetime.now() < datetime.fromisoformat(defer_until):
+        return False
+
+    return datetime.now() - datetime.fromisoformat(last_check) > check_interval
 
 
 def get_stored_version(db_path: Path, platform: str) -> Optional[str]:
@@ -164,10 +180,13 @@ def update_version(db_path: Path, platform: str, version: str, is_new_version: b
         is_new_version: Whether this is a new version (updates last_update timestamp).
     """
     now = datetime.now().isoformat()
-    
+
     conn = _connect(db_path)
     cursor = conn.cursor()
-    
+
+    # INSERT OR REPLACE rewrites the whole row, so an unspecified defer_until
+    # resets to NULL — a successful version update naturally clears any pending
+    # defer window. Keep defer_until out of the column list to preserve that.
     if is_new_version:
         cursor.execute("""
             INSERT OR REPLACE INTO versions (platform, version, last_check, last_update)
@@ -179,6 +198,46 @@ def update_version(db_path: Path, platform: str, version: str, is_new_version: b
             VALUES (?, ?, ?, COALESCE((SELECT last_update FROM versions WHERE platform = ?), ?))
         """, (platform, version, now, platform, now))
     
+    conn.commit()
+    conn.close()
+
+
+def set_defer(db_path: Path, platform: str, until: datetime) -> None:
+    """Defer ``platform``'s next version check until ``until``.
+
+    Stamps ``defer_until`` on the existing version row so `should_check_version`
+    keeps serving the cached catalog through a transient outage instead of
+    re-fetching. No-op if the platform has no row yet — a platform that has
+    never been fetched has no stale catalog to fall back on.
+
+    Args:
+        db_path: Path to the SQLite database.
+        platform: Platform identifier.
+        until: Wall-clock time to keep deferring until.
+    """
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE versions SET defer_until = ? WHERE platform = ?",
+        (until.isoformat(), platform),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_defer(db_path: Path, platform: str) -> None:
+    """Clear any active defer window for ``platform``.
+
+    Args:
+        db_path: Path to the SQLite database.
+        platform: Platform identifier.
+    """
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE versions SET defer_until = NULL WHERE platform = ?",
+        (platform,),
+    )
     conn.commit()
     conn.close()
 

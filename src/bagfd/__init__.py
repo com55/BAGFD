@@ -15,12 +15,19 @@ Option enums live in `bagfd.enums` and are imported explicitly:
 """
 
 from .client import BlueArchiveGameFilesDownloader
-from .models import DownloadResult, FileInfo, PackInfo, TooManyFilesError
+from .models import (
+    DownloadResult,
+    FileInfo,
+    PackInfo,
+    ResourceUnavailableError,
+    TooManyFilesError,
+)
 
 __all__ = [
     'BlueArchiveGameFilesDownloader',
     'DownloadResult',
     'FileInfo',
     'PackInfo',
+    'ResourceUnavailableError',
     'TooManyFilesError',
 ]

@@ -9,7 +9,11 @@ from unittest.mock import patch
 
 import pytest
 
-from bagfd import BlueArchiveGameFilesDownloader, TooManyFilesError
+from bagfd import (
+    BlueArchiveGameFilesDownloader,
+    ResourceUnavailableError,
+    TooManyFilesError,
+)
 from bagfd.database import (
     get_stored_version,
     get_table_name,
@@ -313,7 +317,10 @@ class TestDownloadGuard:
         assert exc.value.limit == 50
 
     def test_get_latest_files_none_bypasses(self, client_51, tmp_path):
-        with patch('bagfd.client.download_files', return_value=[]):
+        # Return a full delivery (51 paths) so the completeness guard is
+        # satisfied — this test only asserts max_files=None bypasses the limit.
+        delivered = [tmp_path / 'c' / f'f{i:03d}.bundle' for i in range(51)]
+        with patch('bagfd.client.download_files', return_value=delivered):
             client_51.get_latest_files('*.bundle', platform='global-android',
                                        cache_dir=tmp_path / 'c', max_files=None)
 
@@ -467,3 +474,44 @@ class TestDownloadDelivery:
                              output_dir=out, filter_method="contains")
         assert res.count == 1                                    # no duplicate path
         assert (out / "shared.bundle").read_bytes() == b"SMALL"  # smaller pack won
+
+
+# ---------------------------------------------------------------------------
+# get_latest_files() surfaces an unavailable server as retryable
+# ---------------------------------------------------------------------------
+
+class TestResourceUnavailable:
+    @pytest.fixture
+    def client(self, tmp_path):
+        c = BlueArchiveGameFilesDownloader(data_dir=tmp_path / "data")
+        _seed_global(c.db_path)
+        _seed_japan(c.db_path, "japan-android")
+        _seed_versions(c.db_path)
+        return c
+
+    def test_global_short_delivery_raises(self, client, tmp_path):
+        # download_files swallows failures and returns fewer paths than asked;
+        # get_latest_files should surface that as ResourceUnavailableError.
+        with patch('bagfd.client.download_files', return_value=[]):
+            with pytest.raises(ResourceUnavailableError):
+                client.get_latest_files('ch0230', platform='global-android',
+                                        cache_dir=tmp_path / 'c')
+
+    def test_japan_missing_pack_raises(self, client, tmp_path):
+        # patched downloader places no zip -> the pack is missing -> retryable.
+        with patch('bagfd.client.download_files', return_value=[]):
+            with pytest.raises(ResourceUnavailableError):
+                client.get_latest_files('ch0230_a.bundle', platform='japan-android',
+                                        cache_dir=tmp_path / 'c', filter_method='contains')
+
+    def test_japan_full_delivery_no_raise(self, client, tmp_path):
+        # the pack is present -> extracts normally, no error.
+        zpath = client.zip_cache / 'japan-android' / 'Pack_ch0230.zip'
+        zpath.parent.mkdir(parents=True)
+        with zipfile.ZipFile(zpath, 'w') as zf:
+            zf.writestr('ch0230_a.bundle', b'AAA')
+            zf.writestr('ch0230_b.bundle', b'BBB')
+        with patch('bagfd.client.download_files', return_value=[]):
+            paths = client.get_latest_files('ch0230_a.bundle', platform='japan-android',
+                                            cache_dir=tmp_path / 'c', filter_method='contains')
+        assert len(paths) == 1

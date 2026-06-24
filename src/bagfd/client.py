@@ -43,7 +43,13 @@ from .downloader import DownloadItem, download_files
 from .enums import FilterMethod, Platform, VerifyMethod
 from .fetchers import fetch_global_android, fetch_japan_servers
 from .filter import FileFilter
-from .models import DownloadResult, FileInfo, PackInfo, TooManyFilesError
+from .models import (
+    DownloadResult,
+    FileInfo,
+    PackInfo,
+    ResourceUnavailableError,
+    TooManyFilesError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -185,12 +191,31 @@ class BlueArchiveGameFilesDownloader:
                 )
                 for fi in matches
             ]
-            return download_files(items, self.session, workers, show_progress, verify=verify)
+            delivered = download_files(items, self.session, workers, show_progress, verify=verify)
+            # download_files swallows per-file failures; a short delivery means
+            # the server couldn't serve files the catalog lists — most likely a
+            # maintenance window. Surface it as retryable rather than returning
+            # a silently incomplete set.
+            if len(delivered) < len(items):
+                raise ResourceUnavailableError(
+                    f"{len(items) - len(delivered)} of {len(items)} game file(s) for "
+                    f"{platform} could not be downloaded — could not connect to the game "
+                    f"server; try again later"
+                )
+            return delivered
 
         # Japan: fetch zip packs into the shared zip cache, extract matches.
         packs = self._group_japan(matches)
         zips_dir = self.zip_cache / platform
         self._fetch_japan_zips(packs, zips_dir, verify, workers, show_progress)
+        # Any pack that didn't land means its bytes weren't served — treat the
+        # same maintenance window as retryable instead of extracting a partial set.
+        missing = [name for name in packs if not (zips_dir / name).exists()]
+        if missing:
+            raise ResourceUnavailableError(
+                f"{len(missing)} of {len(packs)} game-file pack(s) for {platform} could "
+                f"not be downloaded — could not connect to the game server; try again later"
+            )
         return self._extract_japan(packs, zips_dir, platform_cache, with_path=False, overwrite=False)
 
     def download(

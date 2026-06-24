@@ -22,6 +22,16 @@ class TooManyFilesError(Exception):
         )
 
 
+class ResourceUnavailableError(Exception):
+    """Raised when matched files can't be downloaded right now.
+
+    The catalog lists the files, but the game server couldn't be reached to
+    fetch the bytes. This may be a maintenance window during a version update,
+    or the game changing its endpoint / access method. Retry; if it keeps
+    failing, the access path may need updating.
+    """
+
+
 @dataclass
 class PackInfo:
     """A Japan zip pack — one catalog row for the Japan platforms.
