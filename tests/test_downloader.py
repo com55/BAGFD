@@ -2,10 +2,27 @@
 Unit tests for bagfd.downloader — no network required.
 """
 import hashlib
+import threading
+import time
 import zlib
+from concurrent.futures import ProcessPoolExecutor
 
-from bagfd.downloader import DownloadItem, _hash_matches, _is_valid_cache
+from bagfd.downloader import DownloadItem, PathLockManager, _hash_matches, _is_valid_cache
 from bagfd.enums import VerifyMethod
+
+
+def _proc_lock_worker(args):
+    """Acquire the path lock in a separate process and record the held window.
+
+    Must be module-level so it is picklable for ProcessPoolExecutor.
+    """
+    lock_dir, target, hold = args
+    mgr = PathLockManager(lock_dir, timeout=30)
+    # Wall-clock time.time() is comparable across processes; monotonic is not.
+    with mgr.lock(target):
+        start = time.time()
+        time.sleep(hold)
+        return (start, time.time())
 
 
 class TestHashMatches:
@@ -78,3 +95,104 @@ class TestIsValidCache:
         item.hash_type = None
         item.hash_value = None
         assert _is_valid_cache(item, VerifyMethod.HASH)  # size still matches
+
+
+class TestPathLockManager:
+    """The lock must serialize access to one path — across threads and processes.
+
+    WinError 32 is a Windows-only symptom and can't be reproduced on Linux, so
+    these tests instead verify the mechanism the fix relies on: that only one
+    holder is ever inside the critical section for a given path at a time.
+    """
+
+    def test_serializes_threads_on_same_path(self, tmp_path):
+        mgr = PathLockManager(tmp_path / "locks")
+        target = tmp_path / "cache" / "pack.zip"
+        state = {"current": 0, "max": 0}
+
+        def worker():
+            with mgr.lock(target):
+                state["current"] += 1
+                state["max"] = max(state["max"], state["current"])
+                time.sleep(0.05)
+                state["current"] -= 1
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert state["max"] == 1
+
+    def test_different_paths_run_concurrently(self, tmp_path):
+        """Distinct paths must not block each other (the lock is per-path)."""
+        mgr = PathLockManager(tmp_path / "locks")
+        state = {"current": 0, "max": 0}
+        guard = threading.Lock()
+
+        def worker(i):
+            with mgr.lock(tmp_path / f"pack_{i}.zip"):
+                with guard:
+                    state["current"] += 1
+                    state["max"] = max(state["max"], state["current"])
+                time.sleep(0.1)
+                with guard:
+                    state["current"] -= 1
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert state["max"] > 1
+
+    def test_serializes_separate_processes_on_same_path(self, tmp_path):
+        lock_dir = str(tmp_path / "locks")
+        target = str(tmp_path / "cache" / "pack.zip")
+        hold = 0.3
+        args = [(lock_dir, target, hold)] * 2
+        with ProcessPoolExecutor(max_workers=2) as ex:
+            windows = list(ex.map(_proc_lock_worker, args))
+
+        windows.sort()
+        # Disjoint held windows: the second process started only after the first
+        # released. A tiny tolerance absorbs wall-clock jitter between procs.
+        assert windows[1][0] >= windows[0][1] - 0.01
+
+
+class TestInvalidationSkipsInUseFiles:
+    """clear_cache_for_platform must not delete a file another holder is using."""
+
+    def test_skips_locked_file_keeps_it(self, tmp_path):
+        from bagfd.database import clear_cache_for_platform
+
+        mgr = PathLockManager(tmp_path / "locks")
+        plat_dir = tmp_path / "zip_cache" / "japan-android"
+        plat_dir.mkdir(parents=True)
+        busy = plat_dir / "Pack_busy.zip"
+        free = plat_dir / "Pack_free.zip"
+        busy.write_bytes(b"BUSY")
+        free.write_bytes(b"FREE")
+
+        # Hold the busy file's lock while invalidation runs (simulates a
+        # concurrent download/extract). It must be skipped; the free one goes.
+        with mgr.lock(busy):
+            clear_cache_for_platform(tmp_path / "zip_cache", "japan-android", mgr)
+
+        assert busy.exists()       # in-use file preserved, not deleted/crashed
+        assert not free.exists()   # idle file still cleared
+
+    def test_removes_all_when_unlocked(self, tmp_path):
+        from bagfd.database import clear_cache_for_platform
+
+        mgr = PathLockManager(tmp_path / "locks")
+        plat_dir = tmp_path / "zip_cache" / "japan-android"
+        plat_dir.mkdir(parents=True)
+        (plat_dir / "a.zip").write_bytes(b"A")
+        (plat_dir / "b.zip").write_bytes(b"B")
+
+        clear_cache_for_platform(tmp_path / "zip_cache", "japan-android", mgr)
+
+        assert list(plat_dir.iterdir()) == []

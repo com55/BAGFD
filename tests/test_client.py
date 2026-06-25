@@ -395,7 +395,7 @@ class TestClean:
 # download() / get_latest_files() — delivery (network mocked)
 # ---------------------------------------------------------------------------
 
-def _fake_download(items, session, workers=10, show_progress=False, verify=VerifyMethod.HASH, force=False):
+def _fake_download(items, session, workers=10, show_progress=False, verify=VerifyMethod.HASH, force=False, locks=None):
     """Stand-in for download_files: writes a stub file at each destination."""
     out = []
     for it in items:

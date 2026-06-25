@@ -7,7 +7,10 @@ import logging
 import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Dict
+from typing import TYPE_CHECKING, Optional, Dict
+
+if TYPE_CHECKING:
+    from .downloader import PathLockManager
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +245,9 @@ def clear_defer(db_path: Path, platform: str) -> None:
     conn.close()
 
 
-def clear_cache_for_platform(cache_dir: Path, platform: str) -> None:
+def clear_cache_for_platform(
+    cache_dir: Path, platform: str, locks: "PathLockManager | None" = None
+) -> None:
     """Clear a platform's cached files, without touching ``cache_dir`` itself.
 
     Removes everything inside ``cache_dir/<platform>/`` only. ``cache_dir`` is
@@ -251,16 +256,41 @@ def clear_cache_for_platform(cache_dir: Path, platform: str) -> None:
     Args:
         cache_dir: Base cache directory path.
         platform: Platform identifier.
+        locks: Optional `PathLockManager`. When given, each cached file is
+            removed only if its per-file lock can be taken without blocking, so
+            a file another client/thread is currently downloading or extracting
+            is skipped (and reclaimed on a later pass) instead of being deleted
+            mid-use — which on Windows raises ``WinError 32``.
     """
     platform_cache = cache_dir / platform
     if not platform_cache.exists():
         return
     for entry in platform_cache.iterdir():
+        _remove_cache_entry(entry, locks)
+    logger.info(f"Cache cleared: {platform}")
+
+
+def _remove_cache_entry(entry: Path, locks: "PathLockManager | None") -> None:
+    """Delete one cache entry, guarded by ``locks`` and tolerant of in-use files."""
+    if locks is not None and entry.is_file():
+        with locks.try_lock(entry) as acquired:
+            if not acquired:
+                logger.debug(f"Skipped in-use cache file: {entry.name}")
+                return
+            _delete_cache_entry(entry)
+    else:
+        _delete_cache_entry(entry)
+
+
+def _delete_cache_entry(entry: Path) -> None:
+    """Remove a file or directory, logging instead of raising if it's in use."""
+    try:
         if entry.is_dir():
             shutil.rmtree(entry)
         else:
             entry.unlink()
-    logger.info(f"Cache cleared: {platform}")
+    except OSError as e:
+        logger.warning(f"Could not remove cache entry {entry.name}: {e}")
 
 
 def save_game_files(db_path: Path, table_name: str, files: list) -> None:

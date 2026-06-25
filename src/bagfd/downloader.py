@@ -13,18 +13,89 @@ each item it decides whether an existing local file can be reused, governed by
 """
 import hashlib
 import logging
+import threading
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+from filelock import FileLock, Timeout
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .enums import VerifyMethod
 
 logger = logging.getLogger(__name__)
+
+
+class PathLockManager:
+    """Serialize access to a cache file across both threads and processes.
+
+    The same cache file can be touched concurrently by several download threads
+    of one client *and* by separate client processes that share a cache
+    directory. Opening it twice at once corrupts a partial download or, on
+    Windows, fails outright (``WinError 32``). For each destination path this
+    layers a process-local ``threading.Lock`` (mutual exclusion between threads)
+    over a cross-process ``filelock.FileLock`` (mutual exclusion between
+    processes). The ``threading.Lock`` is required because ``FileLock`` is
+    thread-local by default and would not reliably exclude sibling threads on
+    its own.
+
+    Lock files live in a central ``lock_dir`` keyed by a hash of the resolved
+    path, so they never litter the cache or the user's output directory.
+    """
+
+    def __init__(self, lock_dir: Path, timeout: float = 300):
+        self.lock_dir = Path(lock_dir)
+        self.timeout = timeout
+        self._guard = threading.Lock()
+        self._thread_locks: dict[str, threading.Lock] = {}
+
+    def _key(self, path: Path) -> str:
+        return hashlib.sha1(str(Path(path).resolve()).encode()).hexdigest()
+
+    @contextmanager
+    def lock(self, path: Path):
+        """Hold the combined thread+process lock for ``path`` for the block."""
+        key = self._key(path)
+        with self._guard:
+            thread_lock = self._thread_locks.setdefault(key, threading.Lock())
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        file_lock = FileLock(str(self.lock_dir / f"{key}.lock"), timeout=self.timeout)
+        with thread_lock, file_lock:
+            yield
+
+    @contextmanager
+    def try_lock(self, path: Path):
+        """Non-blocking acquire; yield True if the lock is held, else False.
+
+        Lets cache invalidation delete a file only when no downloader or
+        extractor currently holds it — so a stale file that is still in use is
+        skipped (and cleaned later) instead of being removed mid-use, which on
+        Windows raises ``WinError 32`` and on Linux strands the open reader.
+        """
+        key = self._key(path)
+        with self._guard:
+            thread_lock = self._thread_locks.setdefault(key, threading.Lock())
+        if not thread_lock.acquire(blocking=False):
+            yield False
+            return
+        try:
+            self.lock_dir.mkdir(parents=True, exist_ok=True)
+            file_lock = FileLock(str(self.lock_dir / f"{key}.lock"), timeout=0)
+            try:
+                file_lock.acquire()
+            except Timeout:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                file_lock.release()
+        finally:
+            thread_lock.release()
 
 
 @dataclass
@@ -90,24 +161,31 @@ def _download_one(
     session: requests.Session,
     verify: VerifyMethod = VerifyMethod.HASH,
     force: bool = False,
+    locks: PathLockManager | None = None,
 ) -> Path:
     """Download a single item, reusing a valid cached file unless ``force``.
 
-    A cached file that fails verification is deleted and re-downloaded.
+    A cached file that fails verification is deleted and re-downloaded. When
+    ``locks`` is given, the whole reuse-or-download decision runs under that
+    path's lock so a concurrent thread or process can't read or overwrite the
+    file mid-write; once the lock is held the cache is re-checked, so a waiter
+    reuses the file the prior holder just finished instead of re-downloading.
     """
-    if not force and _is_valid_cache(item, verify):
-        logger.debug("Cache hit: %s", item.dest.name)
+    cm = locks.lock(item.dest) if locks is not None else nullcontext()
+    with cm:
+        if not force and _is_valid_cache(item, verify):
+            logger.debug("Cache hit: %s", item.dest.name)
+            return item.dest
+        if item.dest.exists():
+            item.dest.unlink()
+        item.dest.parent.mkdir(parents=True, exist_ok=True)
+        response = session.get(item.url, stream=True)
+        response.raise_for_status()
+        with open(item.dest, "wb") as f:
+            for chunk in response.iter_content(chunk_size=65536):
+                f.write(chunk)
+        logger.debug("Downloaded: %s", item.dest.name)
         return item.dest
-    if item.dest.exists():
-        item.dest.unlink()
-    item.dest.parent.mkdir(parents=True, exist_ok=True)
-    response = session.get(item.url, stream=True)
-    response.raise_for_status()
-    with open(item.dest, "wb") as f:
-        for chunk in response.iter_content(chunk_size=65536):
-            f.write(chunk)
-    logger.debug("Downloaded: %s", item.dest.name)
-    return item.dest
 
 
 def download_files(
@@ -117,6 +195,7 @@ def download_files(
     show_progress: bool = False,
     verify: VerifyMethod = VerifyMethod.HASH,
     force: bool = False,
+    locks: PathLockManager | None = None,
 ) -> list[Path]:
     """Download ``items`` concurrently and return the local paths that succeeded.
 
@@ -127,6 +206,8 @@ def download_files(
         show_progress: Show a tqdm progress bar if tqdm is installed.
         verify: Cache-reuse strategy (see `VerifyMethod`).
         force: Always re-download, ignoring any cached file.
+        locks: Optional `PathLockManager` to serialize concurrent access to each
+            destination across threads and processes sharing the cache.
 
     Failed downloads are logged and omitted from the returned list.
     """
@@ -148,7 +229,7 @@ def download_files(
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_dest = {
-            executor.submit(_download_one, item, session, verify, force): item.dest
+            executor.submit(_download_one, item, session, verify, force, locks): item.dest
             for item in items
         }
         futures_iter = (

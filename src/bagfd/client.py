@@ -39,7 +39,7 @@ from .database import (
     get_table_name,
     init_database,
 )
-from .downloader import DownloadItem, download_files
+from .downloader import DownloadItem, PathLockManager, download_files
 from .enums import FilterMethod, Platform, VerifyMethod
 from .fetchers import fetch_global_android, fetch_japan_servers
 from .filter import FileFilter
@@ -94,6 +94,9 @@ class BlueArchiveGameFilesDownloader:
         self._update_locks: dict[str, threading.Lock] = {
             p: threading.Lock() for p in _ALL_PLATFORMS
         }
+        # Serializes access to shared cache files (the JP zip cache especially)
+        # so multiple clients/threads don't open the same file at once.
+        self._file_locks = PathLockManager(self.data_dir / "locks")
 
     # ------------------------------------------------------------------
     # Public API
@@ -191,7 +194,7 @@ class BlueArchiveGameFilesDownloader:
                 )
                 for fi in matches
             ]
-            delivered = download_files(items, self.session, workers, show_progress, verify=verify)
+            delivered = download_files(items, self.session, workers, show_progress, verify=verify, locks=self._file_locks)
             # download_files swallows per-file failures; a short delivery means
             # the server couldn't serve files the catalog lists — most likely a
             # maintenance window. Surface it as retryable rather than returning
@@ -277,7 +280,7 @@ class BlueArchiveGameFilesDownloader:
                 )
                 for fi in matches
             ]
-            delivered = download_files(items, self.session, workers, show_progress, verify=verify, force=True)
+            delivered = download_files(items, self.session, workers, show_progress, verify=verify, force=True, locks=self._file_locks)
         else:
             packs = self._group_japan(matches)
             zips_dir = self.zip_cache / platform
@@ -381,10 +384,10 @@ class BlueArchiveGameFilesDownloader:
 
     def _invalidate(self, platform: str, cache_dir: Path | None = None) -> None:
         """Clear cached files for ``platform`` across all cache locations."""
-        clear_cache_for_platform(self.zip_cache, platform)
-        clear_cache_for_platform(self.data_dir / "download_cache", platform)
+        clear_cache_for_platform(self.zip_cache, platform, self._file_locks)
+        clear_cache_for_platform(self.data_dir / "download_cache", platform, self._file_locks)
         if cache_dir is not None:
-            clear_cache_for_platform(Path(cache_dir), platform)
+            clear_cache_for_platform(Path(cache_dir), platform, self._file_locks)
 
     def _query_platform(self, f: FileFilter, platform: str) -> list[FileInfo]:
         """Match ``f`` against the catalog rows for ``platform``."""
@@ -455,7 +458,7 @@ class BlueArchiveGameFilesDownloader:
             )
             for name, (pk, _matched) in packs.items()
         ]
-        download_files(items, self.session, workers, show_progress, verify=verify)
+        download_files(items, self.session, workers, show_progress, verify=verify, locks=self._file_locks)
 
     def _extract_japan(
         self,
@@ -484,7 +487,9 @@ class BlueArchiveGameFilesDownloader:
             zip_path = zips_dir / name
             if not zip_path.exists():
                 continue
-            with zipfile.ZipFile(zip_path, 'r') as zf:
+            # Hold the same per-file lock used for downloading so we never read a
+            # zip another client/thread is still writing (the WinError 32 path).
+            with self._file_locks.lock(zip_path), zipfile.ZipFile(zip_path, 'r') as zf:
                 for member in zf.namelist():
                     if member not in matched:
                         continue
