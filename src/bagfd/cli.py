@@ -1,12 +1,13 @@
 """Command-line interface for the Blue Archive Game Files Downloader.
 
 Commands:
-    update PLATFORM            refresh the file catalog
-    clean  PLATFORM            clear cached files and catalog rows
-    query  PLATFORM PATTERN    search the catalog (single platform)
-    download PLATFORM PATTERN  download matching files into a directory
+    update SERVER PLATFORM     refresh the file catalog
+    clean  SERVER PLATFORM     clear cached files and catalog rows
+    query  SERVER PLATFORM PATTERN    search one target
+    download SERVER PLATFORM PATTERN  download matching files into a directory
 
-``update``/``clean`` accept ``all``; ``query``/``download`` take one platform.
+The three legacy composite targets remain accepted without a server argument.
+``update``/``clean`` also accept the legacy ``all`` selector.
 """
 import argparse
 import json
@@ -24,14 +25,14 @@ logging.basicConfig(
 )
 
 from .client import BlueArchiveGameFilesDownloader
-from .enums import FilterMethod, Platform, VerifyMethod
+from .enums import FilterMethod, VerifyMethod
 from .filter import FileFilter
 from .models import TooManyFilesError
+from .targets import normalize_target, resolve_targets
 
-_PLATFORMS = [p.value for p in Platform]
-_PLATFORM_CHOICES_ALL = ['all'] + _PLATFORMS
-_PLATFORM_HELP = "platform: all, global-android, japan-android, japan-windows"
-_PLATFORM_HELP_ONE = "platform: global-android, japan-android, japan-windows"
+_PLATFORM_HELP = "device platform: android, ios, windows, or all for bulk commands"
+_SERVER_HELP = "server: global, japan, or all for bulk commands"
+_LEGACY_HELP = "legacy targets: global-android, japan-android, japan-windows"
 _DATA_DIR_HELP = "data directory for catalog DB + zip cache (overrides BAGFD_DATA_DIR)"
 _PROXY_HELP = "HTTP/HTTPS proxy URL, e.g. http://proxy:8080"
 _FILTER_METHOD_HELP = "pattern matching: auto (default), glob, regex, contains, starts_with, ends_with"
@@ -204,6 +205,59 @@ def _human_size(n: int | None) -> str:
     return f"{size:.1f}TB"
 
 
+def _add_selection_arguments(parser, metavar, help_text):
+    parser.add_argument('selection_first', metavar=metavar, help=help_text)
+    parser.add_argument('selection_second', nargs='?', metavar=metavar, help=argparse.SUPPRESS)
+    parser.add_argument('selection_third', nargs='?', metavar=metavar, help=argparse.SUPPRESS)
+
+
+def _parse_cli_selection(parser, args):
+    """Validate selector/pattern tokens before constructing the client."""
+    tokens = [args.selection_first]
+    if args.selection_second is not None:
+        tokens.append(args.selection_second)
+    if args.selection_third is not None:
+        tokens.append(args.selection_third)
+    if args.command in ('update', 'clean'):
+        if len(tokens) == 1:
+            selector = tokens[0]
+            try:
+                if selector == 'all':
+                    resolve_targets(selector)
+                else:
+                    normalize_target(selector)
+            except ValueError as exc:
+                parser.error(str(exc))
+            return selector, None, None
+        if len(tokens) == 2 and tokens[0] in ('global', 'japan', 'all'):
+            server, platform = tokens
+            try:
+                resolve_targets(platform, server=server)
+            except ValueError as exc:
+                parser.error(str(exc))
+            return platform, server, None
+        parser.error(f"expected {_LEGACY_HELP} or SERVER PLATFORM")
+
+    if tokens and tokens[0] in ('global', 'japan'):
+        if len(tokens) != 3:
+            parser.error("expected SERVER PLATFORM PATTERN")
+        server, platform, pattern = tokens
+        try:
+            normalize_target(platform, server=server)
+        except ValueError as exc:
+            parser.error(str(exc))
+        return platform, server, pattern
+
+    if len(tokens) != 2:
+        parser.error(f"expected {_LEGACY_HELP} PATTERN or SERVER PLATFORM PATTERN")
+    target, pattern = tokens
+    try:
+        normalize_target(target)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return target, None, pattern
+
+
 def main():
     parser = argparse.ArgumentParser(description="Blue Archive Game Files Downloader.")
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -216,9 +270,12 @@ def main():
     p_update = subparsers.add_parser(
         'update', parents=[common],
         help="Fetch latest game file catalog.",
-        usage="bagfd update PLATFORM [--force] [--proxy URL] [--data-dir DIR] [-q]",
+        usage="bagfd update (SERVER PLATFORM | TARGET) [--force] [--proxy URL] [--data-dir DIR] [-q]",
     )
-    p_update.add_argument('platform', choices=_PLATFORM_CHOICES_ALL, metavar='PLATFORM', help=_PLATFORM_HELP)
+    _add_selection_arguments(
+        p_update, 'SELECTOR',
+        f"{_SERVER_HELP}; {_PLATFORM_HELP}; {_LEGACY_HELP}; bulk accepts all",
+    )
     p_update.add_argument('--force', action='store_true', help="fetch even if catalog is already up to date")
     p_update.add_argument('--proxy', default=None, metavar='URL', help=_PROXY_HELP)
     p_update.add_argument('--data-dir', type=Path, default=None, metavar='DIR', help=_DATA_DIR_HELP)
@@ -226,18 +283,20 @@ def main():
     p_clean = subparsers.add_parser(
         'clean', parents=[common],
         help="Clear cached files and DB entries.",
-        usage="bagfd clean PLATFORM [--data-dir DIR] [-q]",
+        usage="bagfd clean (SERVER PLATFORM | TARGET) [--data-dir DIR] [-q]",
     )
-    p_clean.add_argument('platform', choices=_PLATFORM_CHOICES_ALL, metavar='PLATFORM', help=_PLATFORM_HELP)
+    _add_selection_arguments(
+        p_clean, 'SELECTOR',
+        f"{_SERVER_HELP}; {_PLATFORM_HELP}; {_LEGACY_HELP}; bulk accepts all",
+    )
     p_clean.add_argument('--data-dir', type=Path, default=None, metavar='DIR', help=_DATA_DIR_HELP)
 
     p_query = subparsers.add_parser(
         'query', parents=[common],
         help="Search filenames in catalog.",
-        usage="bagfd query PLATFORM PATTERN [--format FORMAT] [--filter-method METHOD] [--data-dir DIR] [-q]",
+        usage="bagfd query (SERVER PLATFORM PATTERN | TARGET PATTERN) [--format FORMAT] [--filter-method METHOD] [--data-dir DIR] [-q]",
     )
-    p_query.add_argument('platform', choices=_PLATFORMS, metavar='PLATFORM', help=_PLATFORM_HELP_ONE)
-    p_query.add_argument('pattern', help="filename pattern to match")
+    _add_selection_arguments(p_query, 'ARG', f"SERVER PLATFORM PATTERN or {_LEGACY_HELP} PATTERN")
     p_query.add_argument('--format', choices=_QUERY_FORMATS, default='table', metavar='FORMAT', help=_FORMAT_HELP)
     p_query.add_argument('--color', choices=_COLOR_CHOICES, default='auto', metavar='WHEN', help=_COLOR_HELP)
     p_query.add_argument('--filter-method', choices=[m.value for m in FilterMethod],
@@ -247,11 +306,10 @@ def main():
     p_download = subparsers.add_parser(
         'download', parents=[common],
         help="Download matching files into a directory.",
-        usage="bagfd download PLATFORM PATTERN [-o DIR] [--with-path] [--verify MODE] "
+        usage="bagfd download (SERVER PLATFORM PATTERN | TARGET PATTERN) [-o DIR] [--with-path] [--verify MODE] "
               "[--filter-method METHOD] [--workers N] [--proxy URL] [--data-dir DIR] [-y] [-q]",
     )
-    p_download.add_argument('platform', choices=_PLATFORMS, metavar='PLATFORM', help=_PLATFORM_HELP_ONE)
-    p_download.add_argument('pattern', help="filename pattern to match")
+    _add_selection_arguments(p_download, 'ARG', f"SERVER PLATFORM PATTERN or {_LEGACY_HELP} PATTERN")
     p_download.add_argument('-o', '--output', type=Path, default=Path('./download'), metavar='DIR',
                             help="output directory (default: ./download)")
     p_download.add_argument('--with-path', action='store_true',
@@ -266,6 +324,10 @@ def main():
     p_download.add_argument('--yes', '-y', action='store_true', help="skip confirmation when downloading more than 50 files")
 
     args = parser.parse_args()
+    args.platform, args.server, args.pattern = _parse_cli_selection(
+        {'update': p_update, 'clean': p_clean, 'query': p_query, 'download': p_download}[args.command],
+        args,
+    )
 
     if getattr(args, 'quiet', False):
         logging.getLogger().setLevel(logging.ERROR)
@@ -276,32 +338,46 @@ def main():
             proxy=getattr(args, 'proxy', None),
         )
         platform = args.platform
+        server = args.server
 
         if args.command == 'update':
-            client.update(force=args.force, platform=platform)
+            if server is None:
+                client.update(force=args.force, platform=platform)
+            else:
+                client.update(force=args.force, platform=platform, server=server)
 
         elif args.command == 'clean':
-            client.clean(platform=platform)
-            print(f"Cleaned: {platform}")
+            if server is None:
+                client.clean(platform=platform)
+                print(f"Cleaned: {platform}")
+            else:
+                client.clean(platform=platform, server=server)
+                print(f"Cleaned: {server}/{platform}")
 
         elif args.command == 'query':
-            results = client.query(args.pattern, platform=platform, filter_method=args.filter_method)
+            if server is None:
+                results = client.query(args.pattern, platform=platform, filter_method=args.filter_method)
+            else:
+                results = client.query(args.pattern, platform=platform, server=server,
+                                       filter_method=args.filter_method)
             highlight = FileFilter(args.pattern, args.filter_method) if _want_color(args.color) else None
             print(_render_query(results, args.format, highlight))
 
         elif args.command == 'download':
             def _run(max_files=50):
-                return client.download(
-                    args.pattern,
-                    platform=platform,
-                    output_dir=args.output,
-                    with_path=args.with_path,
-                    verify=args.verify,
-                    filter_method=args.filter_method,
-                    workers=args.workers,
-                    show_progress=True,
-                    max_files=max_files,
-                )
+                kwargs = {
+                    'platform': platform,
+                    'output_dir': args.output,
+                    'with_path': args.with_path,
+                    'verify': args.verify,
+                    'filter_method': args.filter_method,
+                    'workers': args.workers,
+                    'show_progress': True,
+                    'max_files': max_files,
+                }
+                if server is not None:
+                    kwargs['server'] = server
+                return client.download(args.pattern, **kwargs)
             try:
                 result = _run()
             except TooManyFilesError as e:

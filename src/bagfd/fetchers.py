@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Tuple
 from io import BytesIO
+from urllib.parse import urljoin
 import requests
 
 from .crypto import extract_json_from_string, create_key, encrypt_string, decrypt_string
@@ -18,6 +19,8 @@ from .database import (
     get_table_name, save_game_files, set_defer, get_game_files,
     get_cached_japan_api_url, set_cached_japan_api_url,
 )
+from .models import ResourceUnavailableError
+from .targets import split_target
 
 logger = logging.getLogger(__name__)
 
@@ -117,320 +120,459 @@ def _extract_japan_api_url(session: requests.Session, xapk_data: BytesIO) -> str
     raise ValueError("Could not find game config")
 
 
-def fetch_global_android(session: requests.Session, db_path: Path,
-                        force: bool = False, check_interval=None,
-                        defer_on_failure: timedelta = timedelta(minutes=10)) -> bool:
-    """Fetch the Global Android game-file catalog into the database.
+_GLOBAL_API_URL = "https://api-pub.nexon.com/patch/v1.1/version-check"
+_GLOBAL_ANDROID_VERSION_URL = "https://apptopia.com/google-play/app/com.nexon.bluearchive/about"
+_GLOBAL_IOS_VERSION_URL = "https://itunes.apple.com/lookup?id=1571873795&country=us"
+_GLOBAL_IOS_TRACK_ID = 1571873795
+_GLOBAL_IOS_BUNDLE_ID = "com.nexon.bluearchive"
+_GLOBAL_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 
-    Re-fetches and rewrites the catalog rows every time a check is due (per
-    ``check_interval``/``force``) — not only when the app version changes — so
-    a hotfix bundle pushed under the same version is still picked up. Does not
-    touch any download cache — cache invalidation is the caller's responsibility.
 
-    If the catalog can't be fetched (e.g. the server is mid version-update and
-    returns an empty body or an error), the cached catalog is kept untouched and
-    the next check is deferred by ``defer_on_failure`` rather than raising — so a
-    transient maintenance window degrades to serving the previous version.
+def _discover_global_version(session: requests.Session, target: str) -> str:
+    """Discover and validate the store version for one Global target."""
+    _server, device = split_target(target)
+    if device.value == "android":
+        response = session.get(_GLOBAL_ANDROID_VERSION_URL)
+        response.raise_for_status()
+        match = _GLOBAL_VERSION_RE.search(response.text)
+        if not match:
+            raise ValueError("Could not extract version from Apptopia")
+        return match.group(0)
 
-    Args:
-        session: Requests session with proper headers configured.
-        db_path: Path to the SQLite database.
-        force: Force fetch regardless of version check interval.
-        check_interval: Version check interval (uses default if None).
-        defer_on_failure: How long to keep serving the cached catalog before
-            re-attempting, when a fetch fails (default 10 minutes).
+    response = session.get(_GLOBAL_IOS_VERSION_URL)
+    response.raise_for_status()
+    lookup = response.json()
+    if not isinstance(lookup, dict) or not isinstance(lookup.get("results"), list):
+        raise ValueError("Malformed Apple lookup response")
 
-    Returns:
-        True if the catalog changed (new version or a same-version content
-        change), False otherwise.
+    result = next((
+        item for item in lookup["results"]
+        if isinstance(item, dict)
+        and type(item.get("trackId")) is int
+        and item["trackId"] == _GLOBAL_IOS_TRACK_ID
+    ), None)
+    if result is None:
+        raise ValueError("Apple lookup did not contain the Blue Archive trackId")
+    if "bundleId" in result and result["bundleId"] != _GLOBAL_IOS_BUNDLE_ID:
+        raise ValueError("Apple lookup bundleId did not match Blue Archive")
+
+    version = result.get("version")
+    if not isinstance(version, str) or not _GLOBAL_VERSION_RE.fullmatch(version):
+        raise ValueError("Apple lookup did not contain a numeric three-part version")
+    return version
+
+
+def _fetch_global_catalog(
+    session: requests.Session,
+    target: str,
+    version: str,
+) -> list[tuple]:
+    """Fetch and validate one Global target's direct-file catalog."""
+    _server, device = split_target(target)
+    is_ios = device.value == "ios"
+    payload = {
+        "market_game_id": "1571873795" if is_ios else "com.nexon.bluearchive",
+        "market_code": "appstore" if is_ios else "playstore",
+        "curr_build_version": version,
+        "curr_build_number": version.split(".")[-1],
+    }
+
+    addressable_resp = session.post(_GLOBAL_API_URL, json=payload)
+    addressable_resp.raise_for_status()
+    addressable = addressable_resp.json()
+    if not isinstance(addressable, dict):
+        raise ValueError("Malformed Global version-check response")
+    patch = addressable.get("patch")
+    if not isinstance(patch, dict):
+        raise ValueError("Global version-check response is missing patch")
+    manifest_url = patch.get("resource_path")
+    if not isinstance(manifest_url, str) or not manifest_url:
+        raise ValueError("Global version-check response is missing resource_path")
+
+    resources_resp = session.get(manifest_url)
+    resources_resp.raise_for_status()
+    manifest = resources_resp.json()
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("resources"), list):
+        raise ValueError("Malformed Global resource manifest")
+
+    asset_segment = "iOS" if is_ios else "Android"
+    catalog_url = urljoin(manifest_url, ".")
+    files_to_save = []
+    for resource in manifest["resources"]:
+        if not isinstance(resource, dict):
+            raise ValueError("Malformed Global resource record")
+        resource_path = resource.get("resource_path")
+        if not isinstance(resource_path, str) or not resource_path:
+            raise ValueError("Global resource record is missing resource_path")
+        if asset_segment not in resource_path.split("/"):
+            continue
+
+        size = resource.get("resource_size")
+        hash_value = resource.get("resource_hash")
+        if type(size) is not int or size < 0:
+            raise ValueError("Global resource has an invalid resource_size")
+        if not isinstance(hash_value, str) or not hash_value:
+            raise ValueError("Global resource has an invalid resource_hash")
+
+        files_to_save.append((
+            resource_path,
+            urljoin(catalog_url, resource_path.lstrip("/")),
+            "md5",
+            hash_value,
+            size,
+            None,
+        ))
+
+    if not files_to_save:
+        raise ValueError(f"Global {asset_segment} catalog is empty")
+    return files_to_save
+
+
+def fetch_global(session: requests.Session, db_path: Path,
+                 force: bool = False, check_interval=None,
+                 defer_on_failure: timedelta = timedelta(minutes=10),
+                 *, target: str = "global-android") -> bool:
+    """Fetch a validated Global Android or iOS catalog.
+
+    A due check always fetches the selected catalog so same-version hotfixes
+    are visible. Catalog failures keep cached rows and defer only that target;
+    a target with no stored version raises :class:`ResourceUnavailableError`.
     """
+    _server, _device = split_target(target)
+    if target not in ("global-android", "global-ios"):
+        raise ValueError(f"Unsupported Global target: {target!r}")
     if check_interval is None:
         check_interval = timedelta(hours=4)
-    
-    GLOBAL_API_URL = "https://api-pub.nexon.com/patch/v1.1/version-check"
-    # PureAPK now Cloudflare-challenges non-browser requests (503). Switched to
-    # Apptopia's Play Store listing page, same approach upstream BA-AD took.
-    GLOBAL_VERSION_URL = "https://apptopia.com/google-play/app/com.nexon.bluearchive/about"
-    
-    platform = "global-android"
-    
-    if not should_check_version(db_path, platform, force, check_interval):
-        logger.debug(f"Skipped {platform} (checked recently)")
+
+    if not should_check_version(db_path, target, force, check_interval):
+        logger.debug("Skipped %s (checked recently)", target)
         return False
-    
-    logger.info(f"Fetching {platform}...")
-    
-    # Get version from Apptopia's Play Store listing
-    response = session.get(GLOBAL_VERSION_URL)
-    response.raise_for_status()
-    
-    version_pattern = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
-    match = version_pattern.search(response.text)
-    
-    if not match:
-        raise ValueError("Could not extract version from Apptopia")
-    
-    version = match.group(0)
-    stored_version = get_stored_version(db_path, platform)
-    is_new_version = version != stored_version
-    
-    if is_new_version:
-        logger.info(f"New version: {stored_version} → {version}")
-    else:
-        logger.info(f"Version unchanged: {version}")
-    
-    # Always re-fetch the resource list when due, regardless of whether the
-    # version string changed — a hotfix bundle can be pushed under the same
-    # version, and the pointer lookup below is the only place that freshness
-    # signal can surface.
+
+    stored_version = get_stored_version(db_path, target)
+    logger.info("Fetching %s...", target)
     try:
-        build_number = version.split('.')[-1]
-        payload = {
-            "market_game_id": "com.nexon.bluearchive",
-            "market_code": "playstore",
-            "curr_build_version": version,
-            "curr_build_number": build_number
-        }
-
-        addressable_resp = session.post(GLOBAL_API_URL, json=payload)
-        addressable_resp.raise_for_status()
-        addressable = addressable_resp.json()
-        resource_path = addressable['patch']['resource_path']
-        resources_resp = session.get(resource_path)
-        resources_resp.raise_for_status()
-        resources = resources_resp.json()
-
-        catalog_url = resource_path.replace('/resource-data.json', '')
-
-        table_name = get_table_name(platform)
-        files_to_save = []
-
-        for resource in resources.get('resources', []):
-            if '/Android/' in resource['resource_path']:
-                files_to_save.append((
-                    resource['resource_path'],
-                    f"{catalog_url}/{resource['resource_path']}",
-                    'md5',
-                    resource['resource_hash'],
-                    resource['resource_size'],
-                    None
-                ))
-
-        existing_files = get_game_files(db_path, table_name)
-        catalog_changed = {_row_key(r) for r in existing_files} != {_row_key(r) for r in files_to_save}
-        if catalog_changed:
-            save_game_files(db_path, table_name, files_to_save)
-            logger.info(f"Updated {platform}")
-        else:
-            logger.info(f"{platform} catalog unchanged")
+        version = _discover_global_version(session, target)
+        files_to_save = _fetch_global_catalog(session, target, version)
     except (requests.RequestException, ValueError, KeyError) as exc:
-        # The server is most likely mid version-update (empty body, 4xx, or
-        # malformed JSON). Keep the cached catalog untouched, park a short
-        # defer window, and report "no new version" so the caller serves the
-        # previous version instead of crashing the whole conversion.
+        if stored_version is None:
+            raise ResourceUnavailableError(
+                f"Could not fetch the first {target} catalog: {exc}"
+            ) from exc
+
         until = datetime.now() + defer_on_failure
         logger.warning(
             "Global catalog fetch failed (%s); keeping cached catalog and "
             "deferring re-check until %s", exc, until.isoformat(timespec="seconds"),
         )
-        set_defer(db_path, platform, until)
+        set_defer(db_path, target, until)
         return False
 
-    update_version(db_path, platform, version, is_new_version)
+    is_new_version = version != stored_version
+    table_name = get_table_name(target)
+    existing_files = get_game_files(db_path, table_name)
+    catalog_changed = {_row_key(row) for row in existing_files} != {
+        _row_key(row) for row in files_to_save
+    }
+    if catalog_changed:
+        save_game_files(db_path, table_name, files_to_save)
+        logger.info("Updated %s", target)
+    else:
+        logger.info("%s catalog unchanged", target)
 
+    update_version(db_path, target, version, is_new_version)
     return is_new_version or catalog_changed
+
+
+def fetch_global_android(session: requests.Session, db_path: Path,
+                        force: bool = False, check_interval=None,
+                        defer_on_failure: timedelta = timedelta(minutes=10)) -> bool:
+    """Compatibility wrapper for the original Global Android fetcher."""
+    return fetch_global(
+        session, db_path, force, check_interval, defer_on_failure,
+        target="global-android",
+    )
+
+
+_DEFAULT_JAPAN_TARGETS = ("japan-android", "japan-windows")
+_JAPAN_PATCH_PACKS = {
+    "japan-android": "Android_PatchPack",
+    "japan-ios": "iOS_PatchPack",
+    "japan-windows": "Windows_PatchPack",
+}
+_CATALOG_FETCH_ERRORS = (
+    requests.RequestException, ValueError, KeyError, zipfile.BadZipFile,
+)
+_YOSTAR_FETCH_ERRORS = (
+    *_CATALOG_FETCH_ERRORS, TypeError, AttributeError, IndexError,
+)
+
+
+def _select_japan_targets(requested_targets) -> list[str]:
+    if requested_targets is None:
+        return list(_DEFAULT_JAPAN_TARGETS)
+    if not isinstance(requested_targets, (list, tuple)):
+        raise ValueError("requested_targets must be a list or tuple of Japan targets")
+
+    selected = []
+    for target in requested_targets:
+        try:
+            server, _device = split_target(target)
+        except ValueError as exc:
+            raise ValueError(f"Invalid Japan target: {target!r}") from exc
+        if server.value != "japan" or target not in _JAPAN_PATCH_PACKS:
+            raise ValueError(f"Invalid Japan target: {target!r}")
+        if target not in selected:
+            selected.append(target)
+    return selected
+
+
+def _japan_catalog_root(addressable) -> str:
+    if not isinstance(addressable, dict):
+        raise ValueError("Malformed Japan addressables response")
+    connection_groups = addressable.get("ConnectionGroups")
+    if not isinstance(connection_groups, list) or not connection_groups:
+        raise ValueError("No ConnectionGroups in addressable response")
+    first_group = connection_groups[0]
+    if not isinstance(first_group, dict):
+        raise ValueError("Malformed first ConnectionGroup")
+    override_groups = first_group.get("OverrideConnectionGroups")
+    if not isinstance(override_groups, list) or len(override_groups) < 2:
+        raise ValueError("Expected at least 2 OverrideConnectionGroups")
+    catalog_group = override_groups[1]
+    if not isinstance(catalog_group, dict):
+        raise ValueError("Malformed OverrideConnectionGroups[1]")
+    catalog_root = catalog_group.get("AddressablesCatalogUrlRoot")
+    if not isinstance(catalog_root, str) or not catalog_root:
+        raise ValueError("AddressablesCatalogUrlRoot not found or empty")
+    return catalog_root.rstrip("/")
+
+
+def _japan_pack_rows(bundle_data, catalog_root: str, patch_pack: str) -> list[tuple]:
+    if not isinstance(bundle_data, dict):
+        raise ValueError("Malformed Japan bundle catalog")
+    full_packs = bundle_data.get("FullPatchPacks")
+    update_packs = bundle_data.get("UpdatePacks")
+    if not isinstance(full_packs, list) or not isinstance(update_packs, list):
+        raise ValueError("Japan FullPatchPacks and UpdatePacks must be lists")
+
+    all_packs = full_packs + update_packs
+    if not all_packs:
+        raise ValueError("Japan bundle catalog contains no packs")
+
+    files_to_save = []
+    for pack in all_packs:
+        if not isinstance(pack, dict):
+            raise ValueError("Malformed Japan pack record")
+        pack_name = pack.get("PackName")
+        crc = pack.get("Crc")
+        pack_size = pack.get("PackSize")
+        if not isinstance(pack_name, str) or not pack_name:
+            raise ValueError("Japan pack is missing PackName")
+        if type(crc) is int:
+            crc_text = str(crc)
+        elif isinstance(crc, str) and re.fullmatch(r"[+-]?[0-9]+", crc):
+            crc_text = crc
+        else:
+            raise ValueError(f"Invalid Japan pack Crc for {pack_name}")
+        if type(pack_size) is not int or pack_size < 0:
+            raise ValueError(f"Invalid Japan PackSize for {pack_name}")
+
+        members = pack.get("BundleFiles")
+        if not isinstance(members, list):
+            raise ValueError(f"Invalid BundleFiles for {pack_name}")
+        member_names = []
+        for member in members:
+            if not isinstance(member, dict):
+                raise ValueError(f"Invalid BundleFiles member in {pack_name}")
+            member_name = member.get("Name")
+            if not isinstance(member_name, str) or not member_name:
+                raise ValueError(f"BundleFiles member has invalid Name in {pack_name}")
+            member_names.append(member_name)
+
+        files_to_save.append((
+            pack_name,
+            f"{catalog_root}/{patch_pack}/{pack_name}",
+            "crc32",
+            crc_text,
+            pack_size,
+            json.dumps(sorted(member_names)),
+        ))
+    return files_to_save
+
+
+def _defer_japan_failures(
+    db_path: Path,
+    targets: list[str],
+    stored_versions: dict[str, str | None],
+    defer_on_failure: timedelta,
+) -> list[str]:
+    until = datetime.now() + defer_on_failure
+    uncached = []
+    for target in targets:
+        if stored_versions[target] is None:
+            uncached.append(target)
+            continue
+        set_defer(db_path, target, until)
+    return uncached
 
 
 def fetch_japan_servers(session: requests.Session, db_path: Path,
                        force: bool = False, check_interval=None,
-                       defer_on_failure: timedelta = timedelta(minutes=10)) -> Dict[str, bool]:
-    """Fetch the Japan Android & Windows game-file catalogs into the database.
+                       defer_on_failure: timedelta = timedelta(minutes=10),
+                       *, requested_targets=None) -> Dict[str, bool]:
+    """Fetch due requested Japan catalogs; defaults to Android and Windows.
 
-    Re-fetches and rewrites the catalog rows for both Japan platforms every
-    time a check is due (per ``check_interval``/``force``) — not only when the
-    app version changes — so a hotfix bundle pushed under the same version is
-    still picked up.
-
-    When the catalog API URL must be refreshed (version change or ``force``),
-    the YoStar launcher ``resources.assets`` path is tried first (~60MB). If
-    that fails, the legacy PureAPK + XAPK extract (~200MB) is used as fallback.
-    At an unchanged version the cached API URL is reused, but the live catalog
-    lookup through it still runs every due check.
-
-    If the catalog can't be fetched (e.g. the server is mid version-update and
-    returns an empty body or an error), the cached catalog is kept untouched and
-    the next check is deferred by ``defer_on_failure`` rather than raising.
-
-    Args:
-        session: Requests session with proper headers configured.
-        db_path: Path to the SQLite database.
-        force: Force fetch regardless of version check interval. Also forces a
-            fresh server-info resolve instead of reusing a cached API URL.
-        check_interval: Version check interval (uses default if None).
-        defer_on_failure: How long to keep serving the cached catalog before
-            re-attempting, when a fetch fails (default 10 minutes).
-
-    Returns:
-        Dict mapping each Japan platform name to whether its catalog changed
-        (new version or a same-version content change).
+    Each target's complete pack catalog is validated before its rows or version
+    are updated. Cached failures are deferred independently; first-fetch
+    failures raise :class:`ResourceUnavailableError` after other targets finish.
     """
-    from .yostar import resolve_japan_server_info_url
+    targets = _select_japan_targets(requested_targets)
+    if not targets:
+        return {}
+
+    from .yostar import get_yostar_base_config, resolve_japan_server_info_url
 
     if check_interval is None:
         check_interval = timedelta(hours=4)
 
-    results = {}
-    due = {}
-    catalog_changed = {}
+    results = {target: False for target in targets}
+    due_targets = []
+    for target in targets:
+        if should_check_version(db_path, target, force, check_interval):
+            logger.info("Checking %s...", target)
+            due_targets.append(target)
+        else:
+            logger.debug("Skipped %s (checked recently)", target)
+    if not due_targets:
+        return results
+
+    stored_versions = {
+        target: get_stored_version(db_path, target)
+        for target in due_targets
+    }
+    cached = get_cached_japan_api_url(db_path)
+    cache_update = None
+    bootstrap_error = None
     current_version = None
     resolved_api_url = None
 
-    japan_platforms = ["japan-android", "japan-windows"]
-
-    for platform_name in japan_platforms:
-        if not should_check_version(db_path, platform_name, force, check_interval):
-            logger.debug(f"Skipped {platform_name} (checked recently)")
-            results[platform_name] = False
-            due[platform_name] = False
-            continue
-        logger.info(f"Checking {platform_name}...")
-        results[platform_name] = False
-        due[platform_name] = True
-
-    # Re-check the catalog whenever either platform is due.
-    if any(due.values()) or force:
-        try:
-            from .yostar import get_yostar_base_config
-
-            cached = get_cached_japan_api_url(db_path)
-            need_fresh_api = force or not cached
-
-            if need_fresh_api:
-                logger.info(
-                    "Resolving Japan server info "
-                    "(YoStar resources.assets, XAPK fallback)..."
+    try:
+        need_fresh_api = force or not cached
+        if need_fresh_api:
+            logger.info(
+                "Resolving Japan server info "
+                "(YoStar resources.assets, XAPK fallback)..."
+            )
+            current_version, resolved_api_url = resolve_japan_server_info_url(session)
+            if not isinstance(current_version, str) or not current_version:
+                raise ValueError("Japan server-info version is invalid")
+            if not isinstance(resolved_api_url, str) or not resolved_api_url:
+                raise ValueError("Japan server-info URL is invalid")
+            cache_update = (current_version, resolved_api_url)
+        else:
+            try:
+                base_config = get_yostar_base_config(session)
+                if not isinstance(base_config, dict):
+                    raise ValueError("Malformed YoStar base config")
+                discovered_version = base_config.get("game_latest_version")
+                if not isinstance(discovered_version, str) or not discovered_version:
+                    raise ValueError("YoStar base config has an invalid version")
+                current_version = discovered_version
+            except _YOSTAR_FETCH_ERRORS as exc:
+                logger.warning(
+                    "YoStar version check failed (%s); using cached version %s",
+                    exc, cached[0],
                 )
-                current_version, api_url = resolve_japan_server_info_url(session)
-                set_cached_japan_api_url(db_path, current_version, api_url)
-                resolved_api_url = api_url
+                current_version = cached[0]
+
+            if cached[0] == current_version:
+                resolved_api_url = cached[1]
+                logger.info("Reusing cached API URL for version %s", current_version)
             else:
-                try:
-                    current_version = get_yostar_base_config(session)["game_latest_version"]
-                except Exception as exc:
-                    logger.warning(
-                        "YoStar version check failed (%s); using cached version %s",
-                        exc, cached[0],
-                    )
-                    current_version = cached[0]
+                logger.info(
+                    "Version changed %s → %s; refreshing server info...",
+                    cached[0], current_version,
+                )
+                current_version, resolved_api_url = resolve_japan_server_info_url(session)
+                if not isinstance(current_version, str) or not current_version:
+                    raise ValueError("Japan server-info version is invalid")
+                if not isinstance(resolved_api_url, str) or not resolved_api_url:
+                    raise ValueError("Japan server-info URL is invalid")
+                cache_update = (current_version, resolved_api_url)
 
-                if cached[0] == current_version:
-                    api_url = cached[1]
-                    logger.info("Reusing cached API URL for version %s", current_version)
-                    resolved_api_url = api_url
-                else:
-                    logger.info(
-                        "Version changed %s → %s; refreshing server info...",
-                        cached[0], current_version,
-                    )
-                    current_version, api_url = resolve_japan_server_info_url(session)
-                    set_cached_japan_api_url(db_path, current_version, api_url)
-                    resolved_api_url = api_url
+        if not isinstance(current_version, str) or not current_version:
+            raise ValueError("Japan version is invalid")
+        if not isinstance(resolved_api_url, str) or not resolved_api_url:
+            raise ValueError("Japan server-info URL is invalid")
 
-            for platform_name in japan_platforms:
-                if not due.get(platform_name):
-                    continue
-                stored_version = get_stored_version(db_path, platform_name)
-                is_new_version = current_version != stored_version
-                if is_new_version:
-                    logger.info(f"New version: {stored_version} → {current_version}")
-                else:
-                    logger.info(f"Version unchanged: {current_version}")
-                results[platform_name] = is_new_version
+    except _YOSTAR_FETCH_ERRORS as exc:
+        bootstrap_error = exc
 
-            logger.info("Fetching catalogs...")
+    if cache_update is not None:
+        set_cached_japan_api_url(db_path, *cache_update)
+
+    if bootstrap_error is None:
+        try:
             addressable_resp = session.get(resolved_api_url)
             addressable_resp.raise_for_status()
             addressable = addressable_resp.json()
-            connection_groups = addressable.get("ConnectionGroups", [])
-            if not connection_groups:
-                raise ValueError("No ConnectionGroups in addressable response")
+            catalog_root = _japan_catalog_root(addressable)
+        except _CATALOG_FETCH_ERRORS as exc:
+            bootstrap_error = exc
 
-            override_groups = connection_groups[0].get("OverrideConnectionGroups", [])
-            if len(override_groups) < 2:
-                raise ValueError(
-                    f"Expected at least 2 OverrideConnectionGroups, got {len(override_groups)}"
-                )
+    if bootstrap_error is not None:
+        logger.warning(
+            "Japan catalog bootstrap failed (%s); keeping cached catalogs and "
+            "deferring requested due targets", bootstrap_error,
+        )
+        uncached = _defer_japan_failures(
+            db_path, due_targets, stored_versions, defer_on_failure,
+        )
+        if uncached:
+            raise ResourceUnavailableError(
+                "Could not fetch first Japan catalog(s): " + ", ".join(uncached)
+            ) from bootstrap_error
+        return results
 
-            catalog_url = override_groups[1].get("AddressablesCatalogUrlRoot", "")
-            if not catalog_url:
-                raise ValueError(
-                    "AddressablesCatalogUrlRoot not found or empty in OverrideConnectionGroups[1]"
-                )
-
-            # Process both platforms
-            for platform_name in japan_platforms:
-                platform_key = "Windows" if platform_name == "japan-windows" else "Android"
-                patch_pack = f"{platform_key}_PatchPack"
-                logger.info(f"Downloading {platform_name} catalog...")
-
-                bundle_url = f"{catalog_url}/{patch_pack}/BundlePackingInfo.json"
-                bundle_resp = session.get(bundle_url)
-                bundle_resp.raise_for_status()
-                bundle_data = bundle_resp.json()
-
-                table_name = get_table_name(platform_name)
-                files_to_save = []
-
-                all_packs = bundle_data.get('FullPatchPacks', []) + bundle_data.get('UpdatePacks', [])
-
-                for pack in all_packs:
-                    # Sorted so the JSON is stable regardless of the order the
-                    # server lists members in — an unrelated reorder shouldn't
-                    # register as a catalog change.
-                    bundle_files = json.dumps(sorted(bf['Name'] for bf in pack.get('BundleFiles', [])))
-
-                    files_to_save.append((
-                        pack['PackName'],
-                        f"{catalog_url}/{patch_pack}/{pack['PackName']}",
-                        'crc32',
-                        str(pack['Crc']),
-                        pack['PackSize'],
-                        bundle_files
-                    ))
-
-                existing_files = get_game_files(db_path, table_name)
-                changed = {_row_key(r) for r in existing_files} != {_row_key(r) for r in files_to_save}
-                catalog_changed[platform_name] = changed
-                if changed:
-                    save_game_files(db_path, table_name, files_to_save)
-                    logger.info(f"Updated {platform_name}")
-                else:
-                    logger.info(f"{platform_name} catalog unchanged")
-        except (requests.RequestException, ValueError, KeyError) as exc:
-            # The server is most likely mid version-update (empty body, 4xx, or
-            # malformed JSON). Keep the cached catalog untouched, park a short
-            # defer window, and report "no new version" so the caller serves the
-            # previous version instead of crashing the whole conversion.
-            until = datetime.now() + defer_on_failure
+    failed_first_fetches = []
+    for target in due_targets:
+        patch_pack = _JAPAN_PATCH_PACKS[target]
+        bundle_url = f"{catalog_root}/{patch_pack}/BundlePackingInfo.json"
+        logger.info("Downloading %s catalog...", target)
+        try:
+            bundle_resp = session.get(bundle_url)
+            bundle_resp.raise_for_status()
+            bundle_data = bundle_resp.json()
+            files_to_save = _japan_pack_rows(bundle_data, catalog_root, patch_pack)
+        except _CATALOG_FETCH_ERRORS as exc:
             logger.warning(
-                "Japan catalog fetch failed (%s); keeping cached catalog and "
-                "deferring re-check until %s", exc, until.isoformat(timespec="seconds"),
+                "Japan catalog fetch failed for %s (%s); keeping its cached "
+                "catalog and deferring re-check", target, exc,
             )
-            for platform_name in japan_platforms:
-                set_defer(db_path, platform_name, until)
-                results[platform_name] = False
-            return results
+            if stored_versions[target] is None:
+                failed_first_fetches.append((target, exc))
+            else:
+                set_defer(db_path, target, datetime.now() + defer_on_failure)
+            results[target] = False
+            continue
 
-    # Update version info only for platforms that were actually due this run.
-    # Touching last_check on a non-due platform would reset its check interval
-    # without having performed a real check.
-    if current_version:
-        for platform_name in japan_platforms:
-            if not due.get(platform_name):
-                continue
-            update_version(db_path, platform_name, current_version, results[platform_name])
+        table_name = get_table_name(target)
+        existing_files = get_game_files(db_path, table_name)
+        catalog_changed = {_row_key(row) for row in existing_files} != {
+            _row_key(row) for row in files_to_save
+        }
+        is_new_version = current_version != stored_versions[target]
+        if catalog_changed:
+            save_game_files(db_path, table_name, files_to_save)
+            logger.info("Updated %s", target)
+        else:
+            logger.info("%s catalog unchanged", target)
+        update_version(db_path, target, current_version, is_new_version)
+        results[target] = is_new_version or catalog_changed
 
-    return {
-        platform_name: results.get(platform_name, False) or catalog_changed.get(platform_name, False)
-        for platform_name in japan_platforms
-    }
+    if failed_first_fetches:
+        target, exc = failed_first_fetches[0]
+        raise ResourceUnavailableError(
+            "Could not fetch first Japan catalog for " + target
+        ) from exc
+    return results

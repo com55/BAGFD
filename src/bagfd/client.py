@@ -20,8 +20,9 @@ an optionally overridden catalog DB):
                                   (default ``data_dir/download_cache``)
 - ``output_dir``                — files delivered by `download` (default ``./download``)
 
-Platform/verify/filter options are `StrEnum`s, so the enum members and their
-string values ("global-android", "hash", "glob", …) are interchangeable.
+Platform, server, verify, and filter options are `StrEnum`s, so enum members
+and their string values ("global-android", "global", "hash", "glob", …) are
+interchangeable.
 """
 from __future__ import annotations
 
@@ -43,8 +44,8 @@ from .database import (
     prune_stale_cache,
 )
 from .downloader import DownloadItem, PathLockManager, download_files
-from .enums import FilterMethod, Platform, VerifyMethod
-from .fetchers import fetch_global_android, fetch_japan_servers
+from .enums import FilterMethod, Platform, Server, VerifyMethod
+from .fetchers import fetch_global, fetch_japan_servers
 from .filter import FileFilter
 from .models import (
     DownloadResult,
@@ -53,14 +54,15 @@ from .models import (
     ResourceUnavailableError,
     TooManyFilesError,
 )
+from .targets import SUPPORTED_TARGETS, normalize_target, resolve_targets, split_target
 
 logger = logging.getLogger(__name__)
 
-_ALL_PLATFORMS = [Platform.GLOBAL_ANDROID, Platform.JAPAN_ANDROID, Platform.JAPAN_WINDOWS]
+_ALL_PLATFORMS = SUPPORTED_TARGETS
 
 
 class BlueArchiveGameFilesDownloader:
-    """Download Blue Archive game files across the three supported platforms.
+    """Download Blue Archive game files across supported server/platform targets.
 
     Args:
         data_dir: Fixed directory for the catalog DB (unless ``db_path`` is given)
@@ -124,33 +126,37 @@ class BlueArchiveGameFilesDownloader:
     def query(
         self,
         pattern: str,
-        platform: Platform,
+        platform: Platform | str,
         filter_method: FilterMethod = FilterMethod.AUTO,
         update_background: bool = False,
+        *,
+        server: Server | str | None = None,
     ) -> list[FileInfo]:
-        """Search the catalog for files matching ``pattern`` on ``platform``.
+        """Search the catalog for files matching ``pattern`` on one target.
 
         Refreshes the catalog if stale, then returns metadata only — nothing is
         downloaded.
 
         Args:
             pattern: Filename pattern.
-            platform: A single platform (``all`` is not accepted).
+            platform: A legacy target, or a device platform when ``server`` is
+                supplied (``all`` is not accepted).
+            server: Optional server for the split server/platform form.
             filter_method: Matching strategy (see `FilterMethod`).
             update_background: If True, a due catalog refresh is kicked off on
                 a daemon thread instead of blocking this call. The query then
                 runs against whatever is currently in the catalog — possibly
-                stale, or empty if this platform has never been fetched. At
-                most one background refresh runs per platform at a time;
+                stale, or empty if this target has never been fetched. At
+                most one background refresh runs per target at a time;
                 redundant calls while one is in flight are skipped.
 
         Returns:
             A `FileInfo` per matching bundle file.
 
         Raises:
-            ValueError: If ``platform`` is not one of the three platforms.
+            ValueError: If the selected server/platform target is invalid.
         """
-        platform = self._validate_platform(platform)
+        platform = self._validate_platform(platform, server=server)
         self._ensure_fresh(platform, background=update_background)
         f = FileFilter(pattern, filter_method)
         return self._query_platform(f, platform)
@@ -158,13 +164,15 @@ class BlueArchiveGameFilesDownloader:
     def get_latest_files(
         self,
         pattern: str,
-        platform: Platform,
+        platform: Platform | str,
         cache_dir: Path | None = None,
         verify: VerifyMethod = VerifyMethod.HASH,
         filter_method: FilterMethod = FilterMethod.AUTO,
         workers: int = 10,
         show_progress: bool = False,
         max_files: int | None = 50,
+        *,
+        server: Server | str | None = None,
     ) -> list[Path]:
         """Ensure the latest matching files exist in ``cache_dir`` and return them.
 
@@ -176,7 +184,9 @@ class BlueArchiveGameFilesDownloader:
 
         Args:
             pattern: Filename pattern.
-            platform: A single platform (``all`` is not accepted).
+            platform: A legacy target, or a device platform when ``server`` is
+                supplied (``all`` is not accepted).
+            server: Optional server for the split server/platform form.
             cache_dir: Where to store/return files. Defaults to
                 ``data_dir/download_cache``.
             verify: Cache-reuse strategy (see `VerifyMethod`).
@@ -185,16 +195,16 @@ class BlueArchiveGameFilesDownloader:
             show_progress: Show a progress bar if tqdm is installed.
             max_files: Raise `TooManyFilesError` if more than this many match
                 (default 50; pass ``None`` for unlimited). The guard keeps
-                pipelines from accidentally pulling an entire platform.
+                pipelines from accidentally pulling an entire target.
 
         Returns:
             Paths to the matching files inside ``cache_dir``.
 
         Raises:
-            ValueError: If ``platform`` is invalid.
+            ValueError: If the selected server/platform target is invalid.
             TooManyFilesError: If matches exceed ``max_files``.
         """
-        platform = self._validate_platform(platform)
+        platform = self._validate_platform(platform, server=server)
         cache_dir = Path(cache_dir) if cache_dir is not None else self.data_dir / "download_cache"
         self._ensure_fresh(platform, cache_dir=cache_dir)
 
@@ -205,7 +215,8 @@ class BlueArchiveGameFilesDownloader:
         platform_cache = cache_dir / platform
         platform_cache.mkdir(parents=True, exist_ok=True)
 
-        if platform == Platform.GLOBAL_ANDROID:
+        target_server, _device = split_target(platform)
+        if target_server is Server.GLOBAL:
             items = [
                 DownloadItem(
                     url=fi.url, dest=platform_cache / fi.name, size=fi.size,
@@ -243,7 +254,7 @@ class BlueArchiveGameFilesDownloader:
     def download(
         self,
         pattern: str,
-        platform: Platform,
+        platform: Platform | str,
         output_dir: str | Path = "./download",
         with_path: bool = False,
         verify: VerifyMethod = VerifyMethod.HASH,
@@ -251,6 +262,8 @@ class BlueArchiveGameFilesDownloader:
         workers: int = 10,
         show_progress: bool = False,
         max_files: int | None = 50,
+        *,
+        server: Server | str | None = None,
     ) -> DownloadResult:
         """Download the latest matching files into ``output_dir``.
 
@@ -261,7 +274,9 @@ class BlueArchiveGameFilesDownloader:
 
         Args:
             pattern: Filename pattern.
-            platform: A single platform (``all`` is not accepted).
+            platform: A legacy target, or a device platform when ``server`` is
+                supplied (``all`` is not accepted).
+            server: Optional server for the split server/platform form.
             output_dir: Destination directory. Defaults to ``./download``.
             with_path: If True, recreate each file's original relative path
                 under ``output_dir``; if False (default), write files flat by
@@ -277,10 +292,10 @@ class BlueArchiveGameFilesDownloader:
             A `DownloadResult` with the delivered paths, count, and total bytes.
 
         Raises:
-            ValueError: If ``platform`` is invalid.
+            ValueError: If the selected server/platform target is invalid.
             TooManyFilesError: If matches exceed ``max_files``.
         """
-        platform = self._validate_platform(platform)
+        platform = self._validate_platform(platform, server=server)
         self._ensure_fresh(platform)
 
         f = FileFilter(pattern, filter_method)
@@ -290,7 +305,8 @@ class BlueArchiveGameFilesDownloader:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
-        if platform == Platform.GLOBAL_ANDROID:
+        target_server, _device = split_target(platform)
+        if target_server is Server.GLOBAL:
             items = [
                 DownloadItem(
                     url=fi.url,
@@ -309,8 +325,15 @@ class BlueArchiveGameFilesDownloader:
         total = sum(p.stat().st_size for p in delivered if p.exists())
         return DownloadResult(files=delivered, output_dir=out, total_bytes=total)
 
-    def update(self, force: bool = False, platform="all", cache_dir: Path | None = None) -> None:
-        """Refresh the file catalog for one or all platforms.
+    def update(
+        self,
+        force: bool = False,
+        platform="all",
+        cache_dir: Path | None = None,
+        *,
+        server: Server | str | None = None,
+    ) -> None:
+        """Refresh the file catalog for one or all supported targets.
 
         When the catalog changes (new version, or a same-version content
         change such as a hotfix), stale caches for that platform are pruned:
@@ -319,25 +342,35 @@ class BlueArchiveGameFilesDownloader:
 
         Args:
             force: Fetch even if the catalog was checked recently.
-            platform: A platform, or ``"all"`` for every platform.
+            platform: A legacy target, a device platform with ``server``, or
+                ``"all"`` for all five targets unless scoped by ``server``.
+            server: Optional server selector; ``"all"`` includes both servers.
             cache_dir: Extra cache directory to invalidate on a new version
                 (e.g. a custom ``get_latest_files`` cache).
         """
-        for p in self._resolve_platforms(platform):
+        for p in self._resolve_platforms(platform, server=server):
             if self._fetch_platform(p, force):
                 self._prune_stale_cache(p, cache_dir)
 
-    def clean(self, platform="all", cache_dir: Path | None = None) -> None:
-        """Remove cached files and catalog rows for one or all platforms.
+    def clean(
+        self,
+        platform="all",
+        cache_dir: Path | None = None,
+        *,
+        server: Server | str | None = None,
+    ) -> None:
+        """Remove cached files and catalog rows for one or all targets.
 
         Clears the zip cache, the default download cache, the catalog rows (and
         version record), and ``cache_dir`` if given.
 
         Args:
-            platform: A platform, or ``"all"`` for every platform.
+            platform: A legacy target, a device platform with ``server``, or
+                ``"all"`` for all five targets unless scoped by ``server``.
+            server: Optional server selector; ``"all"`` includes both servers.
             cache_dir: Extra cache directory to clear too.
         """
-        for p in self._resolve_platforms(platform):
+        for p in self._resolve_platforms(platform, server=server):
             self._invalidate(p, cache_dir)
             clear_platform_db(self.db_path, p)
 
@@ -345,21 +378,23 @@ class BlueArchiveGameFilesDownloader:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _validate_platform(self, platform) -> str:
-        """Return ``platform`` as a string, or raise if it isn't a real platform."""
-        p = str(platform)
-        if p not in _ALL_PLATFORMS:
-            valid = ", ".join(pl.value for pl in Platform)
-            raise ValueError(f"Invalid platform: {platform!r}. Use one of: {valid}")
-        return p
+    def _validate_platform(
+        self,
+        platform: Platform | str,
+        *,
+        server: Server | str | None = None,
+    ) -> str:
+        """Return one validated composite target for internal use."""
+        return normalize_target(platform, server=server)
 
-    def _resolve_platforms(self, platform) -> list[str]:
-        """Expand ``"all"`` / a single value / a list into a list of platforms."""
-        if platform == "all":
-            return list(_ALL_PLATFORMS)
-        if isinstance(platform, str):
-            return [platform]
-        return list(platform)
+    def _resolve_platforms(
+        self,
+        platform,
+        *,
+        server: Server | str | None = None,
+    ) -> list[str]:
+        """Expand and validate one bulk server/platform selection."""
+        return resolve_targets(platform, server=server)
 
     def _guard_count(self, matches: list, max_files: int | None) -> None:
         """Raise `TooManyFilesError` if ``matches`` exceeds ``max_files``."""
@@ -367,10 +402,13 @@ class BlueArchiveGameFilesDownloader:
             raise TooManyFilesError(len(matches), max_files)
 
     def _fetch_platform(self, platform: str, force: bool) -> bool:
-        """Refresh the catalog for one platform; return True if the catalog changed."""
-        if platform == Platform.GLOBAL_ANDROID:
-            return fetch_global_android(self.session, self.db_path, force)
-        results = fetch_japan_servers(self.session, self.db_path, force)
+        """Refresh one validated target and report whether its catalog changed."""
+        target_server, _device = split_target(platform)
+        if target_server is Server.GLOBAL:
+            return fetch_global(self.session, self.db_path, force, target=platform)
+        results = fetch_japan_servers(
+            self.session, self.db_path, force, requested_targets=[platform],
+        )
         return bool(results.get(platform))
 
     def _ensure_fresh(self, platform: str, cache_dir: Path | None = None, background: bool = False) -> None:
@@ -439,7 +477,8 @@ class BlueArchiveGameFilesDownloader:
         zip is cheap, so that tier is cleared outright instead.
         """
         table_name = get_table_name(platform)
-        if platform == Platform.GLOBAL_ANDROID:
+        target_server, _device = split_target(platform)
+        if target_server is Server.GLOBAL:
             valid = self._valid_hashes(table_name, basename=True)
             prune_stale_cache(self.data_dir / "download_cache", platform, valid, self._file_locks)
             if cache_dir is not None:
@@ -456,7 +495,8 @@ class BlueArchiveGameFilesDownloader:
         """Match ``f`` against the catalog rows for ``platform``."""
         rows = get_game_files(self.db_path, get_table_name(platform))
         result: list[FileInfo] = []
-        if platform == Platform.GLOBAL_ANDROID:
+        target_server, _device = split_target(platform)
+        if target_server is Server.GLOBAL:
             for path, url, hash_type, hash_value, size, _bundle in rows:
                 name = path.split('/')[-1]
                 if f.matches(name):

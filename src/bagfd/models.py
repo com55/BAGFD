@@ -9,6 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .enums import Platform, Server
+from .targets import split_target
+
 
 class TooManyFilesError(Exception):
     """Raised when a pattern matches more files than the allowed limit."""
@@ -34,7 +37,7 @@ class ResourceUnavailableError(Exception):
 
 @dataclass
 class PackInfo:
-    """A Japan zip pack — one catalog row for the Japan platforms.
+    """A Japan zip pack — one catalog row for a Japan target.
 
     Attributes:
         name: The zip filename (the catalog row's ``path``).
@@ -58,20 +61,20 @@ class PackInfo:
 class FileInfo:
     """A single matched bundle file.
 
-    For **Global Android** every field is populated from the bundle's own
-    catalog row. For **Japan** platforms a "file" lives inside a zip pack, so
+    For **Global** targets every field is populated from the bundle's own
+    catalog row. For **Japan** targets a "file" lives inside a zip pack, so
     the per-file ``path``/``url``/``hash``/``size`` are ``None`` and the
     zip-level information is carried on ``pack`` instead.
 
     Attributes:
         name: Bundle filename.
-        platform: Platform identifier (a `Platform` value).
-        path: GLOBAL — bundle path within the game's file tree; JP — ``None``.
-        url: GLOBAL — direct bundle URL; JP — ``None`` (see ``pack.url``).
-        hash_type: GLOBAL — usually ``"md5"``; JP — ``None`` (see ``pack``).
-        hash_value: GLOBAL — bundle hash; JP — ``None``.
-        size: GLOBAL — bundle size in bytes; JP — ``None`` (see ``pack.size``).
-        pack: GLOBAL — ``None``; JP — the `PackInfo` of the owning zip.
+        platform: Composite target identifier (e.g. ``global-ios``).
+        path: Global bundle path within the game's file tree; Japan — ``None``.
+        url: Global direct bundle URL; Japan — ``None`` (see ``pack.url``).
+        hash_type: Global usually ``"md5"``; Japan — ``None`` (see ``pack``).
+        hash_value: Global bundle hash; Japan — ``None``.
+        size: Global bundle size in bytes; Japan — ``None`` (see ``pack.size``).
+        pack: Global — ``None``; Japan — the `PackInfo` of the owning zip.
     """
 
     name: str
@@ -82,6 +85,16 @@ class FileInfo:
     hash_value: str | None
     size: int | None
     pack: PackInfo | None
+
+    @property
+    def server(self) -> Server:
+        """Server enum derived from the composite ``platform`` target."""
+        return split_target(self.platform)[0]
+
+    @property
+    def device_platform(self) -> Platform:
+        """Device platform enum derived from the composite ``platform`` target."""
+        return split_target(self.platform)[1]
 
 
 @dataclass

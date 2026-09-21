@@ -16,7 +16,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-VALID_TABLE_NAMES = {"global_android", "japan_android", "japan_windows"}
+VALID_TABLE_NAMES = {
+    "global_android",
+    "global_ios",
+    "japan_android",
+    "japan_ios",
+    "japan_windows",
+}
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -86,7 +92,13 @@ def init_database(db_path: Path) -> None:
 
     # Create separate tables for each platform. `path` is the primary key — no
     # surrogate id / AUTOINCREMENT, so nothing climbs across catalog refreshes.
-    for table_name in ["global_android", "japan_android", "japan_windows"]:
+    for table_name in [
+        "global_android",
+        "global_ios",
+        "japan_android",
+        "japan_ios",
+        "japan_windows",
+    ]:
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS {table_name} (
                 path TEXT PRIMARY KEY,
@@ -118,14 +130,16 @@ def get_table_name(platform: str) -> str:
     """Get table name for platform.
     
     Args:
-        platform: Platform identifier ('global_android', 'japan_android', or 'japan_windows').
+        platform: Composite platform identifier.
         
     Returns:
         Database table name for the platform.
     """
     table_map = {
         "global-android": "global_android",
+        "global-ios": "global_ios",
         "japan-android": "japan_android",
+        "japan-ios": "japan_ios",
         "japan-windows": "japan_windows",
     }
     return table_map.get(platform, "")

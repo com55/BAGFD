@@ -17,6 +17,7 @@ from bagfd.database import (
     should_check_version,
     update_version,
 )
+from bagfd.enums import Platform
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +33,10 @@ class TestGetTableName:
 
     def test_japan_windows(self):
         assert get_table_name("japan-windows") == "japan_windows"
+
+    def test_ios_tables(self):
+        assert get_table_name("global-ios") == "global_ios"
+        assert get_table_name("japan-ios") == "japan_ios"
 
     def test_unknown_returns_empty(self):
         assert get_table_name("unknown-platform") == ""
@@ -59,6 +64,8 @@ class TestInitDatabase:
         assert "global_android" in tables
         assert "japan_android" in tables
         assert "japan_windows" in tables
+        assert "global_ios" in tables
+        assert "japan_ios" in tables
 
     def test_idempotent(self, tmp_path):
         db = tmp_path / "test.db"
@@ -95,6 +102,156 @@ class TestDatabasePragmasAndSchema:
         ])
         rows = get_game_files(db, table)
         assert rows == [("Android/a.bundle", "https://cdn/a", "md5", "h1", 10, None)]
+
+    def test_ios_tables_have_the_existing_catalog_schema(self, tmp_path):
+        db = tmp_path / "catalog.db"
+        init_database(db)
+        conn = sqlite3.connect(db)
+        old_schema = conn.execute("PRAGMA table_info(global_android)").fetchall()
+        global_ios_schema = conn.execute("PRAGMA table_info(global_ios)").fetchall()
+        japan_ios_schema = conn.execute("PRAGMA table_info(japan_ios)").fetchall()
+        conn.close()
+
+        assert global_ios_schema == old_schema
+        assert japan_ios_schema == old_schema
+
+        for platform in (Platform.GLOBAL_ANDROID, "global-ios", "japan-ios"):
+            table = get_table_name(platform)
+            save_game_files(db, table, [
+                ("iOS/a.bundle", "https://cdn/a", "md5", "h1", 10, None),
+            ])
+            assert get_game_files(db, table) == [
+                ("iOS/a.bundle", "https://cdn/a", "md5", "h1", 10, None),
+            ]
+
+    def test_reopening_old_seeded_database_preserves_existing_data_and_cache(self, tmp_path):
+        db = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db)
+        conn.execute("""CREATE TABLE versions (
+            platform TEXT PRIMARY KEY,
+            version TEXT NOT NULL,
+            last_check TIMESTAMP NOT NULL,
+            last_update TIMESTAMP NOT NULL,
+            defer_until TIMESTAMP
+        )""")
+        old_table_names = (
+            "global_android",
+            "japan_android",
+            "japan_windows",
+        )
+        for table_name in old_table_names:
+            conn.execute(f"""CREATE TABLE {table_name} (
+                path TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                hash_type TEXT NOT NULL,
+                hash_value TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                bundle_files TEXT
+            )""")
+        conn.execute("""CREATE TABLE japan_api_cache (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version TEXT NOT NULL,
+            api_url TEXT NOT NULL
+        )""")
+
+        old_platforms = (
+            "global-android",
+            "japan-android",
+            "japan-windows",
+        )
+        for platform in old_platforms:
+            conn.execute(
+                "INSERT INTO versions "
+                "(platform, version, last_check, last_update, defer_until) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    platform,
+                    f"version-{platform}",
+                    "2024-02-03T04:05:06",
+                    "2024-01-02T03:04:05",
+                    "2099-01-01T00:00:00",
+                ),
+            )
+        conn.execute(
+            "INSERT INTO japan_api_cache (id, version, api_url) VALUES (1, ?, ?)",
+            ("1.2.3", "https://api.example"),
+        )
+        conn.commit()
+        conn.close()
+
+        for platform in old_platforms:
+            save_game_files(db, get_table_name(platform), [
+                (f"{platform}/a.bundle", "https://cdn/a", "md5", platform, 10, None),
+            ])
+
+        conn = sqlite3.connect(db)
+        old_schema = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        old_versions = conn.execute(
+            "SELECT platform, version, last_check, last_update, defer_until "
+            "FROM versions ORDER BY platform"
+        ).fetchall()
+        old_api_cache = conn.execute(
+            "SELECT id, version, api_url FROM japan_api_cache"
+        ).fetchall()
+        conn.close()
+        old_catalogs = {
+            platform: get_game_files(db, get_table_name(platform))
+            for platform in old_platforms
+        }
+
+        cache_root = tmp_path / "zip_cache"
+        for platform in old_platforms:
+            marker = cache_root / platform / "keep.txt"
+            marker.parent.mkdir(parents=True)
+            marker.write_text(platform)
+        old_cache = {
+            str(path.relative_to(cache_root)): path.read_text()
+            for path in cache_root.rglob("*")
+            if path.is_file()
+        }
+
+        init_database(db)
+
+        conn = sqlite3.connect(db)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        schema_after = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        versions_after = conn.execute(
+            "SELECT platform, version, last_check, last_update, defer_until "
+            "FROM versions ORDER BY platform"
+        ).fetchall()
+        api_cache_after = conn.execute(
+            "SELECT id, version, api_url FROM japan_api_cache"
+        ).fetchall()
+        conn.close()
+
+        assert {"global_ios", "japan_ios"} <= tables
+        assert {name: schema_after[name] for name in old_schema} == old_schema
+        assert versions_after == old_versions
+        assert api_cache_after == old_api_cache
+        assert {
+            platform: get_game_files(db, get_table_name(platform))
+            for platform in old_platforms
+        } == old_catalogs
+        assert {
+            str(path.relative_to(cache_root)): path.read_text()
+            for path in cache_root.rglob("*")
+            if path.is_file()
+        } == old_cache
 
 
 # ---------------------------------------------------------------------------
