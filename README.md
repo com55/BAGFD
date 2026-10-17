@@ -102,7 +102,7 @@ old_files = client.query('ch0230', platform=Platform.GLOBAL_ANDROID)
 
 Enums live in `bagfd.enums`; they are not re-exported from `bagfd`. `Server` values are `GLOBAL` and `JAPAN`. `Platform` includes the bare device values `ANDROID`, `IOS`, and `WINDOWS`, plus the retained legacy composites `GLOBAL_ANDROID`, `JAPAN_ANDROID`, and `JAPAN_WINDOWS`.
 
-Single-target methods (`query`, `get_latest_files`, and `download`) require a concrete target. A bare device platform requires a server. When `server` is supplied, `platform` must be a bare device value; do not pass a composite target alongside it.
+Pattern-based methods (`query`, `get_latest_files`, and `download`) require a concrete target. `download_files()` infers its target from the supplied `FileInfo` records and requires them all to share it. A bare device platform requires a server. When `server` is supplied, `platform` must be a bare device value; do not pass a composite target alongside it.
 
 ### `query` — metadata only
 
@@ -164,6 +164,19 @@ print(result.count, result.total_bytes, result.output_dir)
 for path in result:
     print(path)
 ```
+
+Global flat output (`with_path=False`) can overwrite files from different catalog paths when they share a basename. Use `with_path=True` to preserve their relative paths.
+
+### `download_files` — deliver selected `FileInfo` records
+
+Pass records returned by `query()` to download them as one batch. The supplied records are used directly without refreshing or querying the catalog again. All records must belong to the same target; `max_files` does not apply.
+
+```python
+selected = client.query('azusa_swimsuit_spr', server=Server.GLOBAL, platform=Platform.IOS)
+result = client.download_files(selected, output_dir='./download', with_path=True)
+```
+
+The same Global flat-output basename collision note applies when `with_path=False`; use `with_path=True` when same-basename files from different catalog paths may be selected.
 
 `DownloadResult` contains `files`, `output_dir`, and `total_bytes`; it supports `.count`, `len()`, and iteration.
 

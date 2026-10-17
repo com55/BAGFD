@@ -931,6 +931,141 @@ class TestDownloadDelivery:
         assert (out / 'ch0230_foo.bundle').exists()
         assert result.output_dir == out
 
+    def test_download_files_global_batches_supplied_file_infos(self, client, tmp_path):
+        files = client.query('ch023', platform='global-android')
+        out = tmp_path / 'batch-out'
+
+        with patch('bagfd.client.download_files', side_effect=_fake_download) as batch_download:
+            with patch.object(client, '_ensure_fresh') as refresh:
+                result = client.download_files(files, output_dir=out, with_path=True)
+
+        refresh.assert_not_called()
+        batch_download.assert_called_once()
+        assert len(batch_download.call_args.args[0]) == 2
+        assert result.count == 2
+        assert result.total_bytes == 8
+        assert set(result.files) == {
+            out / 'Android' / 'ch0230_foo.bundle',
+            out / 'Android' / 'ch0231_bar.bundle',
+        }
+
+    def test_download_files_global_returns_partial_success(self, client, tmp_path):
+        files = client.query('ch023', platform='global-android')
+        out = tmp_path / 'partial-out'
+
+        def download_first(items, *_args, **_kwargs):
+            items[0].dest.parent.mkdir(parents=True, exist_ok=True)
+            items[0].dest.write_bytes(b'OK')
+            return [items[0].dest]
+
+        with patch('bagfd.client.download_files', side_effect=download_first):
+            result = client.download_files(files, output_dir=out, with_path=True)
+
+        assert result.count == 1
+        assert result.files == [out / 'Android' / 'ch0230_foo.bundle']
+        assert result.total_bytes == 2
+
+    def test_download_files_global_rejects_path_escape(self, client, tmp_path):
+        files = client.query('ch0230', platform='global-android')
+        files[0].path = '../escape.bundle'
+        out = tmp_path / 'safe-out'
+
+        with patch('bagfd.client.download_files') as batch_download:
+            with pytest.raises(ValueError, match='escapes output directory'):
+                client.download_files(files, output_dir=out, with_path=True)
+
+        batch_download.assert_not_called()
+        assert not (tmp_path / 'escape.bundle').exists()
+
+    def test_download_files_global_rejects_flat_name_escape(self, client, tmp_path):
+        files = client.query('ch0230', platform='global-android')
+        files[0].name = '../escape.bundle'
+        out = tmp_path / 'safe-out'
+
+        with patch('bagfd.client.download_files') as batch_download:
+            with pytest.raises(ValueError, match='escapes output directory'):
+                client.download_files(files, output_dir=out, with_path=False)
+
+        batch_download.assert_not_called()
+        assert not (tmp_path / 'escape.bundle').exists()
+
+    def test_download_files_empty_list_returns_empty_result(self, client, tmp_path):
+        out = tmp_path / 'empty-out'
+
+        with patch.object(client, '_ensure_fresh') as refresh:
+            with patch('bagfd.client.download_files') as batch_download:
+                result = client.download_files([], output_dir=out)
+
+        refresh.assert_not_called()
+        batch_download.assert_not_called()
+        assert result.files == []
+        assert result.count == 0
+        assert result.total_bytes == 0
+        assert result.output_dir == out
+        assert out.is_dir()
+
+    def test_download_files_rejects_mixed_targets(self, client, tmp_path):
+        global_file = client.query('ch0230', platform='global-android')[0]
+        japan_file = client.query('ch0230_a', platform='japan-android')[0]
+
+        with patch('bagfd.client.download_files') as batch_download:
+            with pytest.raises(ValueError, match='one target'):
+                client.download_files([global_file, japan_file], output_dir=tmp_path / 'out')
+
+        batch_download.assert_not_called()
+
+    def test_download_files_japan_fetches_shared_pack_once(self, client, tmp_path):
+        files = client.query('ch0230', platform='japan-android')
+        zpath = client.zip_cache / 'japan-android' / 'Pack_ch0230.zip'
+        zpath.parent.mkdir(parents=True)
+        with zipfile.ZipFile(zpath, 'w') as zf:
+            zf.writestr('ch0230_a.bundle', b'AAA')
+            zf.writestr('ch0230_b.bundle', b'BBBB')
+        out = tmp_path / 'japan-out'
+
+        with patch('bagfd.client.download_files', return_value=[]) as batch_download:
+            result = client.download_files(files, output_dir=out, with_path=True)
+
+        batch_download.assert_called_once()
+        assert len(batch_download.call_args.args[0]) == 1
+        assert result.count == 2
+        assert result.total_bytes == 7
+        assert set(result.files) == {
+            out / 'ch0230_a.bundle', out / 'ch0230_b.bundle',
+        }
+
+    def test_download_files_japan_returns_partial_success(self, client, tmp_path):
+        files = client.query('bundle', platform='japan-android')
+        zpath = client.zip_cache / 'japan-android' / 'Pack_Image.zip'
+        zpath.parent.mkdir(parents=True)
+        with zipfile.ZipFile(zpath, 'w') as zf:
+            zf.writestr('Image_CueSheet_001.bundle', b'ONE')
+            zf.writestr('Image_CueSheet_002.bundle', b'TWO2')
+        out = tmp_path / 'japan-partial-out'
+
+        def download_only_image_pack(items, *_args, **_kwargs):
+            return [item.dest for item in items if item.dest.name == 'Pack_Image.zip']
+
+        with patch('bagfd.client.download_files', side_effect=download_only_image_pack):
+            result = client.download_files(files, output_dir=out, with_path=True)
+
+        assert result.count == 2
+        assert set(result.files) == {
+            out / 'Image_CueSheet_001.bundle', out / 'Image_CueSheet_002.bundle',
+        }
+        assert result.total_bytes == 7
+
+    def test_download_files_japan_rejects_pack_name_escape(self, client, tmp_path):
+        files = client.query('ch0230_a', platform='japan-android')
+        files[0].pack.name = '../escape.zip'
+
+        with patch('bagfd.client.download_files') as batch_download:
+            with pytest.raises(ValueError, match='escapes zip cache'):
+                client.download_files(files, output_dir=tmp_path / 'out')
+
+        batch_download.assert_not_called()
+        assert not (client.zip_cache / 'escape.zip').exists()
+
     def test_global_with_path(self, client, tmp_path):
         out = tmp_path / "out"
         with patch('bagfd.client.download_files', side_effect=_fake_download):

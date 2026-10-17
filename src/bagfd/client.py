@@ -300,6 +300,11 @@ class BlueArchiveGameFilesDownloader:
         Returns:
             A `DownloadResult` with the delivered paths, count, and total bytes.
 
+        Note:
+            Global flat output can overwrite files from different catalog paths
+            when they share a basename. Use ``with_path=True`` to preserve their
+            relative paths.
+
         Raises:
             ValueError: If the selected server/platform target is invalid.
             TooManyFilesError: If matches exceed ``max_files``.
@@ -332,6 +337,83 @@ class BlueArchiveGameFilesDownloader:
             delivered = self._extract_japan(packs, zips_dir, out, with_path=with_path, overwrite=True)
 
         total = sum(p.stat().st_size for p in delivered if p.exists())
+        return DownloadResult(files=delivered, output_dir=out, total_bytes=total)
+
+    def download_files(
+        self,
+        files: list[FileInfo],
+        output_dir: str | Path = "./download",
+        with_path: bool = False,
+        verify: VerifyMethod = VerifyMethod.HASH,
+        workers: int = 10,
+        show_progress: bool = False,
+    ) -> DownloadResult:
+        """Download the supplied FileInfo records into ``output_dir``.
+
+        Uses the URLs and metadata in ``files`` directly without refreshing or
+        querying the catalog. Every record must belong to the same target.
+
+        Note:
+            Global flat output can overwrite files from different catalog paths
+            when they share a basename. Use ``with_path=True`` to preserve their
+            relative paths.
+
+        Args:
+            files: Selected Global or Japan records returned by `query()`.
+            output_dir: Directory to receive the downloaded files.
+            with_path: Preserve each file's relative path under ``output_dir``.
+            verify: Cache verification strategy for Japan ZIP packs.
+            workers: Maximum number of concurrent downloads.
+            show_progress: Show a progress bar if tqdm is installed.
+
+        Raises:
+            ValueError: If records span targets or a destination escapes its root.
+        """
+        out = Path(output_dir)
+        if not files:
+            out.mkdir(parents=True, exist_ok=True)
+            return DownloadResult(files=[], output_dir=out, total_bytes=0)
+
+        platforms = [self._validate_platform(fi.platform) for fi in files]
+        platform = platforms[0]
+        if any(p != platform for p in platforms[1:]):
+            raise ValueError("All FileInfo records must belong to one target")
+
+        out.mkdir(parents=True, exist_ok=True)
+        target_server, _device = split_target(platform)
+        if target_server is Server.GLOBAL:
+            output_root = out.resolve()
+            items = []
+            for fi in files:
+                relative_path = fi.path if with_path else fi.name
+                if relative_path is None:
+                    raise ValueError("Global FileInfo is missing its output path")
+                dest = out / relative_path
+                if not dest.resolve().is_relative_to(output_root):
+                    raise ValueError(
+                        f"FileInfo destination escapes output directory: {relative_path}"
+                    )
+                items.append(DownloadItem(
+                    url=fi.url, dest=dest, size=fi.size,
+                    hash_type=fi.hash_type, hash_value=fi.hash_value,
+                ))
+            delivered = download_files(
+                items, self.session, workers, show_progress,
+                verify=verify, force=True, locks=self._file_locks,
+            )
+        else:
+            packs = self._group_japan(files)
+            zips_dir = self.zip_cache / platform
+            zip_root = zips_dir.resolve()
+            for name in packs:
+                if not (zips_dir / name).resolve().is_relative_to(zip_root):
+                    raise ValueError(f"Japan pack destination escapes zip cache: {name}")
+            self._fetch_japan_zips(packs, zips_dir, verify, workers, show_progress)
+            delivered = self._extract_japan(
+                packs, zips_dir, out, with_path=with_path, overwrite=True,
+            )
+
+        total = sum(path.stat().st_size for path in delivered if path.exists())
         return DownloadResult(files=delivered, output_dir=out, total_bytes=total)
 
     def update(
