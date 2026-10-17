@@ -135,7 +135,7 @@ Global files, including iOS, are downloaded directly and carry per-file metadata
 
 ### `get_latest_files` — cache and return paths
 
-Ensures that matching files exist in a cache directory, downloading missing or stale files and returning their paths. Global targets use direct bundle downloads. Japan targets cache ZIP packs and extract the matching members.
+Ensures that matching files exist in a cache directory, downloading missing or stale files and returning their paths. The cache preserves each file's catalog path under `cache_dir/<target>/`. Global targets use direct bundle downloads. Japan targets cache ZIP packs and extract the matching members using their paths inside the ZIP.
 
 ```python
 paths = client.get_latest_files(
@@ -206,10 +206,10 @@ The data directory defaults to `platformdirs.user_data_dir("BAGFD")`, or can be 
 |---|---|
 | `data_dir/catalog.db` | file catalogs and version records, keyed by composite target |
 | `data_dir/zip_cache/<target>/` | cached Japan ZIP packs, including Japan iOS |
-| `data_dir/download_cache/<target>/` | files returned by `get_latest_files`, partitioned by composite target |
+| `data_dir/download_cache/<target>/<file path>` | files returned by `get_latest_files`, preserving the catalog or ZIP member path |
 | `./download` (or `output_dir`) | files delivered by `download` |
 
-The existing composite identities and directories remain in place. iOS uses `global-ios` and `japan-ios`; no storage rename or copy is needed.
+The composite target directories remain in place. iOS uses `global-ios` and `japan-ios`. Files cached by older versions at the target root are not reused; a catalog refresh prunes those flat files.
 
 Catalog table names use the composite target with hyphens replaced by underscores (`global_ios`, `japan_ios`). The three existing table names remain unchanged.
 

@@ -328,8 +328,14 @@ def clear_cache_for_platform(
     platform_cache = cache_dir / platform
     if not platform_cache.exists():
         return
-    for entry in platform_cache.iterdir():
-        _remove_cache_entry(entry, locks)
+    for entry in sorted(platform_cache.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if entry.is_dir() and not entry.is_symlink():
+            try:
+                entry.rmdir()
+            except OSError:
+                pass  # A locked file may still be inside.
+        else:
+            _remove_cache_entry(entry, locks)
     logger.info(f"Cache cleared: {platform}")
 
 
@@ -342,14 +348,14 @@ def prune_stale_cache(
     """Remove cached files under ``cache_dir/<platform>/`` no longer valid.
 
     Unlike `clear_cache_for_platform` (which wipes everything), this keeps any
-    cached file whose name is still in ``valid_hashes`` *and* whose on-disk
+    cached file whose relative path is still in ``valid_hashes`` *and* whose on-disk
     hash still matches — so a catalog refresh only evicts the files that
     actually changed or dropped out, not the whole cache.
 
     Args:
         cache_dir: Base cache directory path.
         platform: Platform identifier.
-        valid_hashes: Map of cache filename -> (hash_type, hash_value) built
+        valid_hashes: Map of catalog-relative path -> (hash_type, hash_value) built
             from the current catalog rows.
         locks: Optional `PathLockManager`, passed through to skip files
             another client/thread currently holds (see `clear_cache_for_platform`).
@@ -357,10 +363,17 @@ def prune_stale_cache(
     platform_cache = cache_dir / platform
     if not platform_cache.exists():
         return
-    for entry in platform_cache.iterdir():
-        if not entry.is_file():
-            continue
-        _prune_cache_entry(entry, valid_hashes.get(entry.name), locks)
+    for entry in sorted(platform_cache.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if entry.is_symlink():
+            _remove_cache_entry(entry, locks)
+        elif entry.is_file():
+            key = entry.relative_to(platform_cache).as_posix()
+            _prune_cache_entry(entry, valid_hashes.get(key), locks)
+        elif entry.is_dir():
+            try:
+                entry.rmdir()
+            except OSError:
+                pass  # Keep directories containing valid or locked files.
 
 
 def _prune_cache_entry(
@@ -398,7 +411,7 @@ def _remove_cache_entry(entry: Path, locks: "PathLockManager | None") -> None:
 def _delete_cache_entry(entry: Path) -> None:
     """Remove a file or directory, logging instead of raising if it's in use."""
     try:
-        if entry.is_dir():
+        if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry)
         else:
             entry.unlink()

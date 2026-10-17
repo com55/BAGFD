@@ -320,7 +320,7 @@ class TestSplitClientApi:
         assert queried.url == 'https://ios/ch0230_ios.bundle'
         assert queried.server is Server.GLOBAL
         assert queried.device_platform is Platform.IOS
-        assert cached == [cache_root / 'global-ios' / 'ch0230_ios.bundle']
+        assert cached == [cache_root / 'global-ios' / 'iOS' / 'ch0230_ios.bundle']
         assert cached[0].read_bytes() == b'XXXX'
         assert result.files == [output_dir / 'iOS' / 'ch0230_ios.bundle']
         assert result.files[0].read_bytes() == b'XXXX'
@@ -347,7 +347,7 @@ class TestSplitClientApi:
                 output_dir=output_dir, with_path=True,
             )
 
-        assert cached == [cache_root / 'japan-ios' / 'ch0230_ios.bundle']
+        assert cached == [cache_root / 'japan-ios' / 'iOS' / 'ch0230_ios.bundle']
         assert cached[0].read_bytes() == b'IOS'
         assert result.files == [output_dir / 'iOS' / 'ch0230_ios.bundle']
         assert result.files[0].read_bytes() == b'IOS'
@@ -376,8 +376,8 @@ class TestSplitClientApi:
             android = client.get_latest_files('shared.bundle', platform='global-android', cache_dir=cache_root)
             ios = client.get_latest_files('shared.bundle', platform='ios', server='global', cache_dir=cache_root)
 
-        assert android == [cache_root / 'global-android' / 'shared.bundle']
-        assert ios == [cache_root / 'global-ios' / 'shared.bundle']
+        assert android == [cache_root / 'global-android' / 'Android' / 'shared.bundle']
+        assert ios == [cache_root / 'global-ios' / 'iOS' / 'shared.bundle']
         assert android[0].read_bytes() == b'android/shared.bundle'
         assert ios[0].read_bytes() == b'ios/shared.bundle'
 
@@ -414,7 +414,7 @@ class TestSplitClientApi:
             ('iOS/keep.bundle', 'https://ios/keep.bundle', 'md5', hashlib.md5(keep).hexdigest(), len(keep), None),
             ('iOS/stale.bundle', 'https://ios/stale.bundle', 'md5', hashlib.md5(stale).hexdigest(), len(stale), None),
         ])
-        ios_cache = client.data_dir / 'download_cache' / 'global-ios'
+        ios_cache = client.data_dir / 'download_cache' / 'global-ios' / 'iOS'
         ios_cache.mkdir(parents=True)
         (ios_cache / 'keep.bundle').write_bytes(keep)
         (ios_cache / 'stale.bundle').write_bytes(stale)
@@ -832,9 +832,11 @@ class TestUpdatePrunesCache:
         _seed_versions(c.db_path)
 
         cache_dir = c.data_dir / "download_cache" / "global-android"
-        cache_dir.mkdir(parents=True)
-        (cache_dir / "keep.bundle").write_bytes(b"KEEP")
-        (cache_dir / "stale.bundle").write_bytes(b"STALE")
+        nested_dir = cache_dir / "Android"
+        nested_dir.mkdir(parents=True)
+        (nested_dir / "keep.bundle").write_bytes(b"KEEP")
+        (nested_dir / "stale.bundle").write_bytes(b"STALE")
+        (cache_dir / "keep.bundle").write_bytes(b"OLD FLAT CACHE")
 
         def fake_fetch(session, db_path, force=False, check_interval=None, *, target):
             assert target == 'global-android'
@@ -847,8 +849,9 @@ class TestUpdatePrunesCache:
         with patch('bagfd.client.fetch_global', side_effect=fake_fetch):
             c.update(platform='global-android')
 
-        assert (cache_dir / "keep.bundle").exists()
-        assert not (cache_dir / "stale.bundle").exists()
+        assert (nested_dir / "keep.bundle").exists()
+        assert not (nested_dir / "stale.bundle").exists()
+        assert not (cache_dir / "keep.bundle").exists()
 
     def test_japan_hash_sweeps_zip_cache_but_clears_extracted_files(self, tmp_path):
         c = BlueArchiveGameFilesDownloader(data_dir=tmp_path)
@@ -860,8 +863,8 @@ class TestUpdatePrunesCache:
         (zip_dir / "Pack_stale.zip").write_bytes(b"STALE")
 
         extracted_dir = c.data_dir / "download_cache" / "japan-android"
-        extracted_dir.mkdir(parents=True)
-        (extracted_dir / "member.bundle").write_bytes(b"whatever")
+        (extracted_dir / "Android").mkdir(parents=True)
+        (extracted_dir / "Android" / "member.bundle").write_bytes(b"whatever")
 
         def fake_fetch(session, db_path, force=False, check_interval=None, *, requested_targets):
             assert requested_targets == ['japan-android']
@@ -880,7 +883,7 @@ class TestUpdatePrunesCache:
         # Extracted individual files aren't catalog-tracked on their own;
         # cheaper to just clear them and let extraction from the (now-valid)
         # zip cache repopulate them.
-        assert not (extracted_dir / "member.bundle").exists()
+        assert not (extracted_dir / "Android" / "member.bundle").exists()
 
     def test_no_catalog_change_leaves_cache_untouched(self, tmp_path):
         c = BlueArchiveGameFilesDownloader(data_dir=tmp_path)
@@ -954,8 +957,30 @@ class TestDownloadDelivery:
         cache = tmp_path / "mycache"
         with patch('bagfd.client.download_files', side_effect=_fake_download):
             paths = client.get_latest_files('ch0230', platform='global-android', cache_dir=cache)
-        assert paths == [cache / 'global-android' / 'ch0230_foo.bundle']
+        assert paths == [cache / 'global-android' / 'Android' / 'ch0230_foo.bundle']
         assert paths[0].exists()
+
+    def test_global_cache_keeps_same_basename_in_different_directories(self, client, tmp_path):
+        save_game_files(client.db_path, get_table_name('global-android'), [
+            ('Android/one/shared.bundle', 'https://cdn/one/shared.bundle', 'md5', 'a', 4, None),
+            ('Android/two/shared.bundle', 'https://cdn/two/shared.bundle', 'md5', 'b', 4, None),
+        ])
+        cache = tmp_path / 'cache'
+        with patch('bagfd.client.download_files', side_effect=_fake_download):
+            paths = client.get_latest_files('shared.bundle', platform='global-android', cache_dir=cache)
+        assert set(paths) == {
+            cache / 'global-android' / 'Android' / 'one' / 'shared.bundle',
+            cache / 'global-android' / 'Android' / 'two' / 'shared.bundle',
+        }
+
+    def test_global_catalog_path_cannot_escape_cache(self, client, tmp_path):
+        save_game_files(client.db_path, get_table_name('global-android'), [
+            ('../escape.bundle', 'https://cdn/escape.bundle', 'md5', 'a', 4, None),
+        ])
+        cache = tmp_path / 'cache'
+        with pytest.raises(ValueError, match='escapes cache directory'):
+            client.get_latest_files('escape.bundle', platform='global-android', cache_dir=cache)
+        assert not (cache / 'escape.bundle').exists()
 
     def test_japan_dedups_to_smallest_pack(self, tmp_path):
         # same bundle present in two packs of different size -> use the smaller

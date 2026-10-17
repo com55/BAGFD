@@ -16,8 +16,9 @@ an optionally overridden catalog DB):
 - ``data_dir/catalog.db``       — the file catalog (path overridable via ``db_path``,
                                   e.g. to keep it off shared/network-backed storage)
 - ``data_dir/zip_cache/<plat>`` — cached JP zip packs (shared by download/get)
-- ``cache_dir/<plat>``          — files returned by `get_latest_files`
-                                  (default ``data_dir/download_cache``)
+- ``cache_dir/<plat>/<path>``   — files returned by `get_latest_files`, using
+                                  catalog or ZIP member paths (default
+                                  ``data_dir/download_cache``)
 - ``output_dir``                — files delivered by `download` (default ``./download``)
 
 Platform, server, verify, and filter options are `StrEnum`s, so enum members
@@ -187,8 +188,8 @@ class BlueArchiveGameFilesDownloader:
             platform: A legacy target, or a device platform when ``server`` is
                 supplied (``all`` is not accepted).
             server: Optional server for the split server/platform form.
-            cache_dir: Where to store/return files. Defaults to
-                ``data_dir/download_cache``.
+            cache_dir: Where to store/return files, preserving their catalog paths.
+                Defaults to ``data_dir/download_cache``.
             verify: Cache-reuse strategy (see `VerifyMethod`).
             filter_method: Matching strategy (see `FilterMethod`).
             workers: Parallel download workers.
@@ -217,9 +218,17 @@ class BlueArchiveGameFilesDownloader:
 
         target_server, _device = split_target(platform)
         if target_server is Server.GLOBAL:
+            cache_root = platform_cache.resolve()
+
+            def cache_destination(path: str) -> Path:
+                dest = platform_cache / path
+                if not dest.resolve().is_relative_to(cache_root):
+                    raise ValueError(f"Catalog path escapes cache directory: {path}")
+                return dest
+
             items = [
                 DownloadItem(
-                    url=fi.url, dest=platform_cache / fi.name, size=fi.size,
+                    url=fi.url, dest=cache_destination(fi.path), size=fi.size,
                     hash_type=fi.hash_type, hash_value=fi.hash_value,
                 )
                 for fi in matches
@@ -249,7 +258,7 @@ class BlueArchiveGameFilesDownloader:
                 f"{len(missing)} of {len(packs)} game-file pack(s) for {platform} could "
                 f"not be downloaded — could not connect to the game server; try again later"
             )
-        return self._extract_japan(packs, zips_dir, platform_cache, with_path=False, overwrite=False)
+        return self._extract_japan(packs, zips_dir, platform_cache, with_path=True, overwrite=False)
 
     def download(
         self,
@@ -452,19 +461,13 @@ class BlueArchiveGameFilesDownloader:
         if cache_dir is not None:
             clear_cache_for_platform(Path(cache_dir), platform, self._file_locks)
 
-    def _valid_hashes(self, table_name: str, basename: bool) -> dict[str, tuple[str, str]]:
-        """Map cache filename -> (hash_type, hash_value) from current catalog rows.
+    def _valid_hashes(self, table_name: str) -> dict[str, tuple[str, str]]:
+        """Map catalog-relative path -> (hash_type, hash_value) from current rows.
 
         Args:
             table_name: Catalog table to read.
-            basename: Global's catalog `path` includes a directory prefix
-                (e.g. ``Android/aa/xyz.bundle``) but cache files are named by
-                basename only; Japan's `path` (the pack name) already matches
-                the cache filename directly.
         """
         rows = get_game_files(self.db_path, table_name)
-        if basename:
-            return {path.split('/')[-1]: (hash_type, hash_value) for path, _url, hash_type, hash_value, _size, _bf in rows}
         return {path: (hash_type, hash_value) for path, _url, hash_type, hash_value, _size, _bf in rows}
 
     def _prune_stale_cache(self, platform: str, cache_dir: Path | None = None) -> None:
@@ -479,13 +482,13 @@ class BlueArchiveGameFilesDownloader:
         table_name = get_table_name(platform)
         target_server, _device = split_target(platform)
         if target_server is Server.GLOBAL:
-            valid = self._valid_hashes(table_name, basename=True)
+            valid = self._valid_hashes(table_name)
             prune_stale_cache(self.data_dir / "download_cache", platform, valid, self._file_locks)
             if cache_dir is not None:
                 prune_stale_cache(Path(cache_dir), platform, valid, self._file_locks)
             return
 
-        valid = self._valid_hashes(table_name, basename=False)
+        valid = self._valid_hashes(table_name)
         prune_stale_cache(self.zip_cache, platform, valid, self._file_locks)
         clear_cache_for_platform(self.data_dir / "download_cache", platform, self._file_locks)
         if cache_dir is not None:

@@ -197,6 +197,25 @@ class TestInvalidationSkipsInUseFiles:
 
         assert list(plat_dir.iterdir()) == []
 
+    def test_nested_clear_skips_locked_file(self, tmp_path):
+        from bagfd.database import clear_cache_for_platform
+
+        mgr = PathLockManager(tmp_path / 'locks')
+        nested = tmp_path / 'cache' / 'japan-ios' / 'iOS'
+        nested.mkdir(parents=True)
+        busy = nested / 'busy.bundle'
+        free = nested / 'free.bundle'
+        busy.write_bytes(b'BUSY')
+        free.write_bytes(b'FREE')
+
+        with mgr.lock(busy):
+            clear_cache_for_platform(tmp_path / 'cache', 'japan-ios', mgr)
+        assert busy.exists()
+        assert not free.exists()
+
+        clear_cache_for_platform(tmp_path / 'cache', 'japan-ios', mgr)
+        assert not nested.exists()
+
 
 class TestPruneStaleCache:
     """prune_stale_cache must keep files whose catalog entry+hash still match
@@ -206,17 +225,18 @@ class TestPruneStaleCache:
         from bagfd.database import prune_stale_cache
 
         plat_dir = tmp_path / "cache" / "global-android"
-        plat_dir.mkdir(parents=True)
-        valid = plat_dir / "valid.bundle"
+        (plat_dir / 'Android' / 'one').mkdir(parents=True)
+        (plat_dir / 'Android' / 'two').mkdir(parents=True)
+        valid = plat_dir / 'Android' / 'one' / 'valid.bundle'
         valid.write_bytes(b"KEEP")
-        stale_hash = plat_dir / "stale_hash.bundle"
+        stale_hash = plat_dir / 'Android' / 'two' / 'stale_hash.bundle'
         stale_hash.write_bytes(b"OLD")
-        orphan = plat_dir / "orphan.bundle"
+        orphan = plat_dir / 'Android' / 'two' / 'orphan.bundle'
         orphan.write_bytes(b"GONE")
 
         valid_hashes = {
-            "valid.bundle": ("md5", hashlib.md5(b"KEEP").hexdigest()),
-            "stale_hash.bundle": ("md5", hashlib.md5(b"NEW").hexdigest()),  # on-disk content is stale
+            "Android/one/valid.bundle": ("md5", hashlib.md5(b"KEEP").hexdigest()),
+            "Android/two/stale_hash.bundle": ("md5", hashlib.md5(b"NEW").hexdigest()),
             # orphan.bundle intentionally has no catalog row
         }
 
@@ -225,6 +245,7 @@ class TestPruneStaleCache:
         assert valid.exists()
         assert not stale_hash.exists()
         assert not orphan.exists()
+        assert not (plat_dir / 'Android' / 'two').exists()
 
     def test_skips_locked_file_keeps_it(self, tmp_path):
         from bagfd.database import prune_stale_cache
