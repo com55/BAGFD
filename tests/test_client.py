@@ -749,6 +749,38 @@ class TestDownloadGuard:
             client_51.get_latest_files('*.bundle', platform='global-android',
                                        cache_dir=tmp_path / 'c', max_files=None)
 
+    def test_get_latest_files_pattern_list_total_limit_checks_union(self, client_51, tmp_path):
+        with pytest.raises(TooManyFilesError) as exc:
+            client_51.get_latest_files(
+                ['f000.bundle', 'f001.bundle'], platform='global-android',
+                cache_dir=tmp_path / 'c', max_files=1,
+            )
+        assert exc.value.count == 2
+        assert exc.value.limit == 1
+
+    def test_get_latest_files_pattern_list_per_pattern_limit(self, client_51, tmp_path):
+        with patch('bagfd.client.download_files', side_effect=_fake_download) as download:
+            paths = client_51.get_latest_files(
+                ['f000.bundle', 'f001.bundle'], platform='global-android',
+                cache_dir=tmp_path / 'c', max_files=1,
+                max_files_scope='per_pattern',
+            )
+
+        assert len(paths) == 2
+        assert len(download.call_args.args[0]) == 2
+
+    def test_get_latest_files_pattern_list_deduplicates_overlapping_patterns(
+        self, client_51, tmp_path,
+    ):
+        with patch('bagfd.client.download_files', side_effect=_fake_download) as download:
+            paths = client_51.get_latest_files(
+                ['f000.bundle', 'f000'], platform='global-android',
+                cache_dir=tmp_path / 'c', max_files=1,
+            )
+
+        assert len(paths) == 1
+        assert len(download.call_args.args[0]) == 1
+
 
 # ---------------------------------------------------------------------------
 # clean()
@@ -1154,13 +1186,51 @@ class TestResourceUnavailable:
         _seed_versions(c.db_path)
         return c
 
-    def test_global_short_delivery_raises(self, client, tmp_path):
-        # download_files swallows failures and returns fewer paths than asked;
-        # get_latest_files should surface that as ResourceUnavailableError.
+    def test_global_zero_delivery_raises(self, client, tmp_path):
+        # get_latest_files raises ResourceUnavailableError when no current files arrive.
         with patch('bagfd.client.download_files', return_value=[]):
             with pytest.raises(ResourceUnavailableError):
                 client.get_latest_files('ch0230', platform='global-android',
                                         cache_dir=tmp_path / 'c')
+
+    def test_global_partial_delivery_warns_and_returns_available_paths(
+        self, client, tmp_path, caplog,
+    ):
+        def download_first(items, *_args, **_kwargs):
+            return [items[0].dest]
+
+        with patch('bagfd.client.download_files', side_effect=download_first):
+            with caplog.at_level('WARNING'):
+                paths = client.get_latest_files(
+                    'ch023', platform='global-android', cache_dir=tmp_path / 'c',
+                )
+
+        assert len(paths) == 1
+        assert 'returning available files' in caplog.text
+
+    def test_fileinfo_list_uses_current_catalog_metadata(self, client, tmp_path):
+        files = client.query('ch0230', platform='global-android')
+        files[0].url = 'https://stale.invalid/file.bundle'
+
+        with patch('bagfd.client.download_files', side_effect=_fake_download) as download:
+            paths = client.get_latest_files(files, cache_dir=tmp_path / 'c')
+
+        items = download.call_args.args[0]
+        assert items[0].url == 'https://cdn/ch0230_foo.bundle'
+        assert paths == [tmp_path / 'c' / 'global-android' / 'Android' / 'ch0230_foo.bundle']
+
+    def test_fileinfo_missing_from_catalog_is_skipped_with_warning(
+        self, client, tmp_path, caplog,
+    ):
+        file_info = client.query('ch0230', platform='global-android')[0]
+        file_info.name = 'removed.bundle'
+        file_info.path = 'Android/removed.bundle'
+
+        with caplog.at_level('WARNING'):
+            paths = client.get_latest_files([file_info], cache_dir=tmp_path / 'c')
+
+        assert paths == []
+        assert 'absent from the current global-android catalog' in caplog.text
 
     def test_japan_missing_pack_raises(self, client, tmp_path):
         # patched downloader places no zip -> the pack is missing -> retryable.

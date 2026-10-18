@@ -149,6 +149,33 @@ paths = client.get_latest_files(
 )
 ```
 
+You can also pass selected `FileInfo` records returned by `query()`. The target
+is inferred from those records, and the current catalog is checked before using
+its metadata and the normal cache. Records no longer present are skipped with a
+warning; if retrieval is partial, the available paths are returned with a
+warning. This form returns `list[Path]` and does not apply `max_files`.
+
+```python
+selected = client.query(
+    'azusa_swimsuit_spr', server=Server.JAPAN, platform=Platform.IOS,
+)
+paths = client.get_latest_files(selected, verify=VerifyMethod.HASH)
+```
+
+Pattern mode also accepts `list[str]`. A file is included if it matches any
+pattern, and overlapping patterns do not duplicate it. `filter_method` applies
+to every pattern. By default, `max_files` applies to the combined unique result;
+set `max_files_scope='per_pattern'` to enforce the limit separately for each
+pattern before combining them.
+
+```python
+paths = client.get_latest_files(
+    ['ch0230_a.bundle', 'ch0230_b.bundle'],
+    server=Server.JAPAN, platform=Platform.ANDROID,
+    max_files=50, max_files_scope='per_pattern',
+)
+```
+
 ### `download` — deliver files into a directory
 
 Downloads matching files into `output_dir` and returns a `DownloadResult`. A match count above `max_files` (default 50) raises `TooManyFilesError`; pass `None` to remove that guard.

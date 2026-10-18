@@ -33,6 +33,7 @@ import os
 import threading
 import zipfile
 from pathlib import Path
+from typing import Literal
 
 import requests
 
@@ -164,8 +165,8 @@ class BlueArchiveGameFilesDownloader:
 
     def get_latest_files(
         self,
-        pattern: str,
-        platform: Platform | str,
+        pattern: str | list[str] | list[FileInfo],
+        platform: Platform | str | None = None,
         cache_dir: Path | None = None,
         verify: VerifyMethod = VerifyMethod.HASH,
         filter_method: FilterMethod = FilterMethod.AUTO,
@@ -174,6 +175,7 @@ class BlueArchiveGameFilesDownloader:
         max_files: int | None = 50,
         *,
         server: Server | str | None = None,
+        max_files_scope: Literal["total", "per_pattern"] = "total",
     ) -> list[Path]:
         """Ensure the latest matching files exist in ``cache_dir`` and return them.
 
@@ -183,40 +185,170 @@ class BlueArchiveGameFilesDownloader:
         the shared zip cache and the matching members are extracted into
         ``cache_dir``.
 
+        When ``pattern`` is a list of ``FileInfo`` records, the catalog is
+        checked for each selected file after the normal freshness check. Records
+        no longer present are skipped with a warning. If only some current files
+        can be retrieved, their paths are returned with a warning; if none can
+        be retrieved, `ResourceUnavailableError` is raised.
+
+        When ``pattern`` is a list of strings, files matching any pattern are
+        included once. The same ``filter_method`` is applied to every pattern.
+
         Args:
-            pattern: Filename pattern.
-            platform: A legacy target, or a device platform when ``server`` is
-                supplied (``all`` is not accepted).
-            server: Optional server for the split server/platform form.
+            pattern: Filename pattern, list of filename patterns, or selected
+                ``FileInfo`` records from `query()`. When records are supplied,
+                every record must belong to the same target and their current
+                catalog entries are used.
+            platform: Required for a filename pattern or list of patterns. For
+                ``FileInfo`` records, inferred from the records and optionally
+                accepted as a check.
+            server: Optional server for the split server/platform form used with
+                a filename pattern, list of patterns, or explicit ``platform``
+                check.
             cache_dir: Where to store/return files, preserving their catalog paths.
                 Defaults to ``data_dir/download_cache``.
             verify: Cache-reuse strategy (see `VerifyMethod`).
-            filter_method: Matching strategy (see `FilterMethod`).
+            filter_method: Matching strategy (see `FilterMethod`); applies to
+                string patterns and each pattern in a list of strings.
             workers: Parallel download workers.
             show_progress: Show a progress bar if tqdm is installed.
-            max_files: Raise `TooManyFilesError` if more than this many match
-                (default 50; pass ``None`` for unlimited). The guard keeps
-                pipelines from accidentally pulling an entire target.
+            max_files: Raise `TooManyFilesError` if a filename pattern or
+                pattern list matches more than this many files (default 50;
+                pass ``None`` for unlimited). Selected ``FileInfo`` records are
+                not limited.
+            max_files_scope: For a list of patterns, ``"total"`` checks the
+                combined unique results (default), while ``"per_pattern"``
+                checks each pattern independently before combining results.
+                A single string is checked as one pattern; ``FileInfo`` lists
+                are not limited by ``max_files``.
 
         Returns:
             Paths to the matching files inside ``cache_dir``.
 
         Raises:
-            ValueError: If the selected server/platform target is invalid.
+            ValueError: If the target is invalid, does not match the records,
+                records span targets, a Global record has no catalog path, or
+                ``max_files_scope`` is invalid.
+            TypeError: If ``pattern`` is not a string, list of strings, or list
+                of ``FileInfo`` records.
             TooManyFilesError: If matches exceed ``max_files``.
+            ResourceUnavailableError: If current catalog matches exist but none
+                can be retrieved.
         """
-        platform = self._validate_platform(platform, server=server)
+        if max_files_scope not in ("total", "per_pattern"):
+            raise ValueError("max_files_scope must be 'total' or 'per_pattern'")
+
+        selected_files: list[FileInfo] | None = None
+        pattern_list: list[str] | None = None
+        if isinstance(pattern, str):
+            if platform is None:
+                raise ValueError("platform is required when pattern is a string")
+            target = self._validate_platform(platform, server=server)
+        elif isinstance(pattern, list):
+            if not pattern:
+                return []
+
+            if all(isinstance(item, str) for item in pattern):
+                pattern_list = [item for item in pattern if isinstance(item, str)]
+                if platform is None:
+                    raise ValueError("platform is required when pattern is a list of strings")
+                target = self._validate_platform(platform, server=server)
+            elif all(isinstance(item, FileInfo) for item in pattern):
+                selected_files = [
+                    item for item in pattern if isinstance(item, FileInfo)
+                ]
+                file_platforms = [
+                    self._validate_platform(fi.platform) for fi in selected_files
+                ]
+                target = file_platforms[0]
+                if any(item_platform != target for item_platform in file_platforms[1:]):
+                    raise ValueError("All FileInfo records must belong to one target")
+
+                if server is not None and platform is None:
+                    raise ValueError("platform is required when server is supplied")
+                if platform is not None:
+                    requested_platform = self._validate_platform(platform, server=server)
+                    if requested_platform != target:
+                        raise ValueError("platform does not match the FileInfo target")
+            else:
+                raise TypeError(
+                    "pattern list must contain only strings or only FileInfo records"
+                )
+        else:
+            raise TypeError(
+                "pattern must be a string, list of strings, or list of FileInfo records"
+            )
+
         cache_dir = Path(cache_dir) if cache_dir is not None else self.data_dir / "download_cache"
-        self._ensure_fresh(platform, cache_dir=cache_dir)
+        self._ensure_fresh(target, cache_dir=cache_dir)
 
-        f = FileFilter(pattern, filter_method)
-        matches = self._query_platform(f, platform)
-        self._guard_count(matches, max_files)
+        if selected_files is None:
+            if pattern_list is None:
+                assert isinstance(pattern, str)
+                f = FileFilter(pattern, filter_method)
+                matches = self._query_platform(f, target)
+                self._guard_count(matches, max_files)
+            else:
+                filters = [FileFilter(item, filter_method) for item in pattern_list]
+                all_files = self._query_platform(
+                    FileFilter("*", FilterMethod.GLOB), target,
+                )
+                is_japan = split_target(target)[0] is Server.JAPAN
 
-        platform_cache = cache_dir / platform
+                def unique_file_count(file_matches: list[FileInfo]) -> int:
+                    if is_japan:
+                        return len({fi.name for fi in file_matches})
+                    return len(file_matches)
+
+                if max_files_scope == "per_pattern" and max_files is not None:
+                    for f in filters:
+                        per_pattern_matches = [
+                            fi for fi in all_files if f.matches(fi.name)
+                        ]
+                        count = unique_file_count(per_pattern_matches)
+                        if count > max_files:
+                            raise TooManyFilesError(count, max_files)
+
+                matches = [
+                    fi for fi in all_files
+                    if any(f.matches(fi.name) for f in filters)
+                ]
+                if max_files_scope == "total":
+                    count = unique_file_count(matches)
+                    if max_files is not None and count > max_files:
+                        raise TooManyFilesError(count, max_files)
+        else:
+            all_files = self._query_platform(FileFilter("*", FilterMethod.GLOB), target)
+            if split_target(target)[0] is Server.GLOBAL:
+                requested_paths = set()
+                for fi in selected_files:
+                    if fi.path is None:
+                        raise ValueError("Global FileInfo is missing its catalog path")
+                    requested_paths.add(fi.path)
+                catalog_paths = {fi.path for fi in all_files}
+                matches = [fi for fi in all_files if fi.path in requested_paths]
+                missing_records = [
+                    fi for fi in selected_files if fi.path not in catalog_paths
+                ]
+            else:
+                requested_names = {fi.name for fi in selected_files}
+                catalog_names = {fi.name for fi in all_files}
+                matches = [fi for fi in all_files if fi.name in requested_names]
+                missing_records = [
+                    fi for fi in selected_files if fi.name not in catalog_names
+                ]
+            if missing_records:
+                logger.warning(
+                    "Skipped %d FileInfo record(s) absent from the current %s catalog",
+                    len(missing_records), target,
+                )
+            if not matches:
+                return []
+
+        platform_cache = cache_dir / target
         platform_cache.mkdir(parents=True, exist_ok=True)
 
-        target_server, _device = split_target(platform)
+        target_server, _device = split_target(target)
         if target_server is Server.GLOBAL:
             cache_root = platform_cache.resolve()
 
@@ -234,31 +366,35 @@ class BlueArchiveGameFilesDownloader:
                 for fi in matches
             ]
             delivered = download_files(items, self.session, workers, show_progress, verify=verify, locks=self._file_locks)
-            # download_files swallows per-file failures; a short delivery means
-            # the server couldn't serve files the catalog lists — most likely a
-            # maintenance window. Surface it as retryable rather than returning
-            # a silently incomplete set.
-            if len(delivered) < len(items):
+            if items and not delivered:
                 raise ResourceUnavailableError(
-                    f"{len(items) - len(delivered)} of {len(items)} game file(s) for "
-                    f"{platform} could not be downloaded — could not connect to the game "
-                    f"server; try again later"
+                    f"None of the {len(items)} current game file(s) for {target} "
+                    f"could be retrieved — could not connect to the game server; try again later"
+                )
+            if len(delivered) < len(items):
+                logger.warning(
+                    "Retrieved %d of %d current game file(s) for %s; returning available files",
+                    len(delivered), len(items), target,
                 )
             return delivered
 
         # Japan: fetch zip packs into the shared zip cache, extract matches.
         packs = self._group_japan(matches)
-        zips_dir = self.zip_cache / platform
+        zips_dir = self.zip_cache / target
         self._fetch_japan_zips(packs, zips_dir, verify, workers, show_progress)
-        # Any pack that didn't land means its bytes weren't served — treat the
-        # same maintenance window as retryable instead of extracting a partial set.
-        missing = [name for name in packs if not (zips_dir / name).exists()]
-        if missing:
+        delivered = self._extract_japan(packs, zips_dir, platform_cache, with_path=True, overwrite=False)
+        expected = len({fi.name for fi in matches})
+        if expected and not delivered:
             raise ResourceUnavailableError(
-                f"{len(missing)} of {len(packs)} game-file pack(s) for {platform} could "
-                f"not be downloaded — could not connect to the game server; try again later"
+                f"None of the {expected} current game file(s) for {target} could be "
+                f"retrieved — could not connect to the game server; try again later"
             )
-        return self._extract_japan(packs, zips_dir, platform_cache, with_path=True, overwrite=False)
+        if len(delivered) < expected:
+            logger.warning(
+                "Retrieved %d of %d current game file(s) for %s; returning available files",
+                len(delivered), expected, target,
+            )
+        return delivered
 
     def download(
         self,
