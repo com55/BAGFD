@@ -78,6 +78,8 @@ For downloads, Global bundle files are fetched fresh and directly; Japan ZIP pac
 
 **`--filter-method`**: `auto` (default), `glob`, `regex`, `contains`, `starts_with`, or `ends_with`. Auto-detection treats `*`, `?`, and `[` as glob syntax; `^`, `$`, `\`, `+`, `|`, and `(` as regex syntax; other patterns as substring matches.
 
+**`--match-case`**: filename matching ignores letter case by default; add this flag to require exact case (Python: `match_case=True` on `query()`, `get_latest_files()` and `download()`).
+
 **`--data-dir`** priority: flag > `BAGFD_DATA_DIR` environment variable > `platformdirs.user_data_dir("BAGFD")` (`XDG_DATA_HOME/BAGFD` on Linux, `%LOCALAPPDATA%\BAGFD` on Windows).
 
 ## Python API

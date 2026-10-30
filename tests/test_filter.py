@@ -73,3 +73,38 @@ class TestFileFilterMatches:
         f = FileFilter('.bundle', 'ends_with')
         assert f.matches('foo.bundle')
         assert not f.matches('foo.bundle.bak')
+
+
+class TestFileFilterMatchCase:
+    CASES = [
+        ('glob', '*.BUNDLE', 'foo.bundle'),
+        ('regex', '^CH\\d+', 'ch0230_foo'),
+        ('contains', 'IMAGE', 'ui_image_hd'),
+        ('starts_with', 'IMAGE_', 'image_cue'),
+        ('ends_with', '.BUNDLE', 'foo.bundle'),
+    ]
+
+    def test_ignores_case_by_default(self):
+        for method, pattern, name in self.CASES:
+            assert FileFilter(pattern, method).matches(name), method
+
+    def test_match_case_requires_exact_case(self):
+        for method, pattern, name in self.CASES:
+            f = FileFilter(pattern, method, match_case=True)
+            assert not f.matches(name), method
+            assert f.matches(_recase(method, pattern)), method
+
+    def test_glob_character_class_ignores_case(self):
+        assert FileFilter('ch[A-Z]*', 'glob').matches('chx1')
+        assert not FileFilter('ch[A-Z]*', 'glob', match_case=True).matches('chx1')
+
+
+def _recase(method, pattern):
+    """A name that matches ``pattern`` exactly, for the match_case=True check."""
+    return {
+        'glob': 'foo.BUNDLE',
+        'regex': 'CH0230_foo',
+        'contains': 'ui_IMAGE_hd',
+        'starts_with': 'IMAGE_cue',
+        'ends_with': 'foo.BUNDLE',
+    }[method]

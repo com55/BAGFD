@@ -21,28 +21,41 @@ class FileFilter:
         pattern: The pattern to match filenames against.
         filter_method: Matching strategy. ``FilterMethod.AUTO`` (default) picks
             a concrete method from the pattern's characters.
+        match_case: If True, letter case must match exactly. The default
+            (False) ignores case for every method, on every OS.
     """
 
-    def __init__(self, pattern: str, filter_method: FilterMethod = FilterMethod.AUTO):
+    def __init__(
+        self,
+        pattern: str,
+        filter_method: FilterMethod = FilterMethod.AUTO,
+        match_case: bool = False,
+    ):
         if filter_method == FilterMethod.AUTO:
             filter_method = self.auto_detect(pattern)
         self.pattern = pattern
         # Normalise a bare string ("glob") into the enum so `matches` can compare
         # against FilterMethod members reliably.
         self.filter_method = FilterMethod(filter_method)
+        self.match_case = match_case
 
     def matches(self, name: str) -> bool:
         """Return True if ``name`` matches this filter."""
+        pattern = self.pattern
+        if self.filter_method == FilterMethod.REGEX:
+            flags = 0 if self.match_case else re.IGNORECASE
+            return bool(re.search(pattern, name, flags))
+        if not self.match_case:
+            name, pattern = name.lower(), pattern.lower()
         if self.filter_method == FilterMethod.GLOB:
-            return fnmatch.fnmatch(name, self.pattern)
-        elif self.filter_method == FilterMethod.REGEX:
-            return bool(re.search(self.pattern, name))
+            # fnmatchcase: plain fnmatch folds case on Windows only.
+            return fnmatch.fnmatchcase(name, pattern)
         elif self.filter_method == FilterMethod.STARTS_WITH:
-            return name.startswith(self.pattern)
+            return name.startswith(pattern)
         elif self.filter_method == FilterMethod.ENDS_WITH:
-            return name.endswith(self.pattern)
+            return name.endswith(pattern)
         else:  # FilterMethod.CONTAINS
-            return self.pattern in name
+            return pattern in name
 
     @staticmethod
     def auto_detect(pattern: str) -> FilterMethod:

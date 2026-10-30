@@ -133,6 +133,7 @@ class BlueArchiveGameFilesDownloader:
         update_background: bool = False,
         *,
         server: Server | str | None = None,
+        match_case: bool = False,
     ) -> list[FileInfo]:
         """Search the catalog for files matching ``pattern`` on one target.
 
@@ -145,6 +146,8 @@ class BlueArchiveGameFilesDownloader:
                 supplied (``all`` is not accepted).
             server: Optional server for the split server/platform form.
             filter_method: Matching strategy (see `FilterMethod`).
+            match_case: If True, letter case must match exactly (default
+                False: case is ignored).
             update_background: If True, a due catalog refresh is kicked off on
                 a daemon thread instead of blocking this call. The query then
                 runs against whatever is currently in the catalog — possibly
@@ -160,7 +163,7 @@ class BlueArchiveGameFilesDownloader:
         """
         platform = self._validate_platform(platform, server=server)
         self._ensure_fresh(platform, background=update_background)
-        f = FileFilter(pattern, filter_method)
+        f = FileFilter(pattern, filter_method, match_case)
         return self._query_platform(f, platform)
 
     def get_latest_files(
@@ -176,6 +179,7 @@ class BlueArchiveGameFilesDownloader:
         *,
         server: Server | str | None = None,
         max_files_scope: Literal["total", "per_pattern"] = "total",
+        match_case: bool = False,
     ) -> list[Path]:
         """Ensure the latest matching files exist in ``cache_dir`` and return them.
 
@@ -221,6 +225,8 @@ class BlueArchiveGameFilesDownloader:
                 checks each pattern independently before combining results.
                 A single string is checked as one pattern; ``FileInfo`` lists
                 are not limited by ``max_files``.
+            match_case: If True, letter case must match exactly (default
+                False: case is ignored). Applies to string patterns only.
 
         Returns:
             Paths to the matching files inside ``cache_dir``.
@@ -285,11 +291,11 @@ class BlueArchiveGameFilesDownloader:
         if selected_files is None:
             if pattern_list is None:
                 assert isinstance(pattern, str)
-                f = FileFilter(pattern, filter_method)
+                f = FileFilter(pattern, filter_method, match_case)
                 matches = self._query_platform(f, target)
                 self._guard_count(matches, max_files)
             else:
-                filters = [FileFilter(item, filter_method) for item in pattern_list]
+                filters = [FileFilter(item, filter_method, match_case) for item in pattern_list]
                 all_files = self._query_platform(
                     FileFilter("*", FilterMethod.GLOB), target,
                 )
@@ -409,6 +415,7 @@ class BlueArchiveGameFilesDownloader:
         max_files: int | None = 50,
         *,
         server: Server | str | None = None,
+        match_case: bool = False,
     ) -> DownloadResult:
         """Download the latest matching files into ``output_dir``.
 
@@ -432,6 +439,8 @@ class BlueArchiveGameFilesDownloader:
             show_progress: Show a progress bar if tqdm is installed.
             max_files: Raise `TooManyFilesError` if more than this many match
                 (``None`` = unlimited).
+            match_case: If True, letter case must match exactly (default
+                False: case is ignored).
 
         Returns:
             A `DownloadResult` with the delivered paths, count, and total bytes.
@@ -448,7 +457,7 @@ class BlueArchiveGameFilesDownloader:
         platform = self._validate_platform(platform, server=server)
         self._ensure_fresh(platform)
 
-        f = FileFilter(pattern, filter_method)
+        f = FileFilter(pattern, filter_method, match_case)
         matches = self._query_platform(f, platform)
         self._guard_count(matches, max_files)
 

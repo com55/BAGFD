@@ -290,7 +290,7 @@ class TestCliEntrypoint:
         assert client.download.call_args.kwargs == {
             "platform": "ios", "server": "global", "output_dir": Path("deliver"),
             "with_path": True, "verify": "size", "filter_method": "contains",
-            "workers": 4, "show_progress": True, "max_files": 50,
+            "match_case": False, "workers": 4, "show_progress": True, "max_files": 50,
         }
 
     def test_invalid_selectors_and_argument_counts_fail_before_client_creation(self):

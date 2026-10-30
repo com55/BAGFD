@@ -83,6 +83,11 @@ def _glob_literals(pattern: str) -> list[str]:
 def _match_spans(name: str, filt: FileFilter) -> list[tuple[int, int]]:
     """Return (start, end) spans of ``name`` that ``filt`` matched on."""
     p, method = filt.pattern, filt.filter_method
+    if method == FilterMethod.REGEX:
+        mo = re.search(p, name, 0 if filt.match_case else re.IGNORECASE)
+        return [mo.span()] if mo and mo.end() > mo.start() else []
+    if not filt.match_case:
+        name, p = name.lower(), p.lower()
     if method == FilterMethod.CONTAINS:
         i = name.find(p)
         return [(i, i + len(p))] if p and i >= 0 else []
@@ -90,9 +95,6 @@ def _match_spans(name: str, filt: FileFilter) -> list[tuple[int, int]]:
         return [(0, len(p))] if p and name.startswith(p) else []
     if method == FilterMethod.ENDS_WITH:
         return [(len(name) - len(p), len(name))] if p and name.endswith(p) else []
-    if method == FilterMethod.REGEX:
-        mo = re.search(p, name)
-        return [mo.span()] if mo and mo.end() > mo.start() else []
     if method == FilterMethod.GLOB:
         spans, cur = [], 0
         for lit in _glob_literals(p):
@@ -294,20 +296,22 @@ def main():
     p_query = subparsers.add_parser(
         'query', parents=[common],
         help="Search filenames in catalog.",
-        usage="bagfd query (SERVER PLATFORM PATTERN | TARGET PATTERN) [--format FORMAT] [--filter-method METHOD] [--data-dir DIR] [-q]",
+        usage="bagfd query (SERVER PLATFORM PATTERN | TARGET PATTERN) [--format FORMAT] [--filter-method METHOD] [--match-case] [--data-dir DIR] [-q]",
     )
     _add_selection_arguments(p_query, 'ARG', f"SERVER PLATFORM PATTERN or {_LEGACY_HELP} PATTERN")
     p_query.add_argument('--format', choices=_QUERY_FORMATS, default='table', metavar='FORMAT', help=_FORMAT_HELP)
     p_query.add_argument('--color', choices=_COLOR_CHOICES, default='auto', metavar='WHEN', help=_COLOR_HELP)
     p_query.add_argument('--filter-method', choices=[m.value for m in FilterMethod],
                          default='auto', metavar='METHOD', help=_FILTER_METHOD_HELP)
+    p_query.add_argument('--match-case', action='store_true',
+                         help="match letter case exactly (default: ignore case)")
     p_query.add_argument('--data-dir', type=Path, default=None, metavar='DIR', help=_DATA_DIR_HELP)
 
     p_download = subparsers.add_parser(
         'download', parents=[common],
         help="Download matching files into a directory.",
         usage="bagfd download (SERVER PLATFORM PATTERN | TARGET PATTERN) [-o DIR] [--with-path] [--verify MODE] "
-              "[--filter-method METHOD] [--workers N] [--proxy URL] [--data-dir DIR] [-y] [-q]",
+              "[--filter-method METHOD] [--match-case] [--workers N] [--proxy URL] [--data-dir DIR] [-y] [-q]",
     )
     _add_selection_arguments(p_download, 'ARG', f"SERVER PLATFORM PATTERN or {_LEGACY_HELP} PATTERN")
     p_download.add_argument('-o', '--output', type=Path, default=Path('./download'), metavar='DIR',
@@ -318,6 +322,8 @@ def main():
                             default='hash', metavar='MODE', help=_VERIFY_HELP)
     p_download.add_argument('--filter-method', choices=[m.value for m in FilterMethod],
                             default='auto', metavar='METHOD', help=_FILTER_METHOD_HELP)
+    p_download.add_argument('--match-case', action='store_true',
+                            help="match letter case exactly (default: ignore case)")
     p_download.add_argument('--workers', type=int, default=10, metavar='N', help="parallel download workers (default: 10)")
     p_download.add_argument('--proxy', default=None, metavar='URL', help=_PROXY_HELP)
     p_download.add_argument('--data-dir', type=Path, default=None, metavar='DIR', help=_DATA_DIR_HELP)
@@ -356,11 +362,12 @@ def main():
 
         elif args.command == 'query':
             if server is None:
-                results = client.query(args.pattern, platform=platform, filter_method=args.filter_method)
+                results = client.query(args.pattern, platform=platform, filter_method=args.filter_method,
+                                       match_case=args.match_case)
             else:
                 results = client.query(args.pattern, platform=platform, server=server,
-                                       filter_method=args.filter_method)
-            highlight = FileFilter(args.pattern, args.filter_method) if _want_color(args.color) else None
+                                       filter_method=args.filter_method, match_case=args.match_case)
+            highlight = FileFilter(args.pattern, args.filter_method, args.match_case) if _want_color(args.color) else None
             print(_render_query(results, args.format, highlight))
 
         elif args.command == 'download':
@@ -371,6 +378,7 @@ def main():
                     'with_path': args.with_path,
                     'verify': args.verify,
                     'filter_method': args.filter_method,
+                    'match_case': args.match_case,
                     'workers': args.workers,
                     'show_progress': True,
                     'max_files': max_files,
