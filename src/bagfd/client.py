@@ -264,7 +264,7 @@ class BlueArchiveGameFilesDownloader:
                     item for item in pattern if isinstance(item, FileInfo)
                 ]
                 file_platforms = [
-                    self._validate_platform(fi.platform) for fi in selected_files
+                    self._validate_composite_target(fi.platform) for fi in selected_files
                 ]
                 target = file_platforms[0]
                 if any(item_platform != target for item_platform in file_platforms[1:]):
@@ -519,7 +519,7 @@ class BlueArchiveGameFilesDownloader:
             out.mkdir(parents=True, exist_ok=True)
             return DownloadResult(files=[], output_dir=out, total_bytes=0)
 
-        platforms = [self._validate_platform(fi.platform) for fi in files]
+        platforms = [self._validate_composite_target(fi.platform) for fi in files]
         platform = platforms[0]
         if any(p != platform for p in platforms[1:]):
             raise ValueError("All FileInfo records must belong to one target")
@@ -622,6 +622,11 @@ class BlueArchiveGameFilesDownloader:
     ) -> str:
         """Return one validated composite target for internal use."""
         return normalize_target(platform, server=server)
+
+    def _validate_composite_target(self, target: str) -> str:
+        """Validate a composite key such as ``global-ios`` (e.g. ``FileInfo.platform``)."""
+        server, platform = split_target(target)
+        return normalize_target(platform.value, server=server.value)
 
     def _resolve_platforms(
         self,

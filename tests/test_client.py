@@ -326,6 +326,42 @@ class TestSplitClientApi:
         assert result.files[0].read_bytes() == b'XXXX'
         assert not (client.zip_cache / 'global-ios').exists()
 
+    def test_fileinfo_inputs_accept_ios_composite_targets(self, client, tmp_path):
+        _seed_global_ios(client.db_path)
+        update_version(client.db_path, 'global-ios', '1.0.0')
+        info = client.query('ch0230_ios.bundle', platform='ios', server='global')[0]
+        assert info.platform == 'global-ios'
+
+        with patch('bagfd.client.download_files', side_effect=_fake_download):
+            cached = client.get_latest_files([info], cache_dir=tmp_path / 'cache')
+            result = client.download_files([info], output_dir=tmp_path / 'out')
+
+        assert cached[0].read_bytes() == b'XXXX'
+        assert result.count == 1
+
+    def test_fileinfo_inputs_accept_japan_ios_composite_target(self, client, tmp_path):
+        _seed_japan_ios(client.db_path)
+        update_version(client.db_path, 'japan-ios', '1.0.0')
+        zip_path = client.zip_cache / 'japan-ios' / 'iOS_Pack.zip'
+        zip_path.parent.mkdir(parents=True)
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            zf.writestr('iOS/ch0230_ios.bundle', b'IOS')
+            zf.writestr('iOS/other.bundle', b'OTHER')
+        info = client.query('ch0230_ios.bundle', platform='ios', server='japan')[0]
+        assert info.platform == 'japan-ios'
+
+        with patch('bagfd.client.download_files', return_value=[]):
+            cached = client.get_latest_files([info], cache_dir=tmp_path / 'cache')
+            result = client.download_files([info], output_dir=tmp_path / 'out')
+
+        assert [p.read_bytes() for p in cached] == [b'IOS']
+        assert result.count == 1
+
+    def test_fileinfo_inputs_reject_unsupported_composite_target(self, client, tmp_path):
+        bad = FileInfo('a.bundle', 'global-windows', None, None, None, None, None, None)
+        with pytest.raises(ValueError):
+            client.get_latest_files([bad], cache_dir=tmp_path / 'cache')
+
     def test_japan_ios_extracts_only_matching_members_to_cache_and_output(self, client, tmp_path):
         _seed_japan_ios(client.db_path)
         update_version(client.db_path, 'japan-ios', '1.0.0')
