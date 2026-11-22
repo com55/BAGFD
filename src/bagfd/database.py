@@ -2,6 +2,8 @@
 Database operations for Blue Archive game files.
 """
 
+import hashlib
+import json
 import sqlite3
 import logging
 import shutil
@@ -122,8 +124,48 @@ def init_database(db_path: Path) -> None:
         )
     """)
 
+    # Content fingerprint of each platform's catalog, so a client can tell
+    # "did it change since I last looked" by comparing `hash` alone.
+    # Kept apart from `versions` (rewritten by INSERT OR REPLACE) and written
+    # in the same transaction as the catalog itself (see save_game_files).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS catalog_revision (
+            table_name TEXT PRIMARY KEY,
+            hash TEXT NOT NULL,
+            changed_at TIMESTAMP NOT NULL
+        )
+    """)
+
+    # Backfill for databases that already hold a catalog but predate this
+    # table. INSERT OR IGNORE keeps any existing revision untouched.
+    for table_name in sorted(VALID_TABLE_NAMES):
+        rows = cursor.execute(
+            f"SELECT path, url, hash_type, hash_value, size, bundle_files "
+            f"FROM {table_name}"
+        ).fetchall()
+        if rows:
+            cursor.execute(
+                "INSERT OR IGNORE INTO catalog_revision (table_name, hash, changed_at) "
+                "VALUES (?, ?, ?)",
+                (table_name, _catalog_hash(rows), datetime.now().isoformat()),
+            )
+
     conn.commit()
     conn.close()
+
+
+def _catalog_hash(files: list) -> str:
+    """Order-independent sha256 of catalog rows.
+
+    Matches the catalog-diff comparison in fetchers (`_row_key`): the file
+    hash is lowercased, so a casing-only upstream change is not a change.
+    """
+    normalized = sorted(
+        (path, url, hash_type, str(hash_value).lower(), size, bundle_files)
+        for path, url, hash_type, hash_value, size, bundle_files in files
+    )
+    payload = json.dumps(normalized, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def get_table_name(platform: str) -> str:
@@ -433,6 +475,7 @@ def save_game_files(db_path: Path, table_name: str, files: list) -> None:
         ValueError: If table name is invalid.
     """
     _validate_table_name(table_name)
+    new_hash = _catalog_hash(files)
     conn = _connect(db_path)
     cursor = conn.cursor()
     cursor.execute(f"DELETE FROM {table_name}")
@@ -442,6 +485,19 @@ def save_game_files(db_path: Path, table_name: str, files: list) -> None:
             INSERT INTO {table_name} (path, url, hash_type, hash_value, size, bundle_files)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (path, url, hash_type, hash_value, size, bundle_files))
+
+    # Same transaction as the rows above: catalog and revision never disagree.
+    # changed_at only moves when the content fingerprint actually changes.
+    cursor.execute(
+        "SELECT hash FROM catalog_revision WHERE table_name = ?", (table_name,)
+    )
+    row = cursor.fetchone()
+    if row is None or row[0] != new_hash:
+        cursor.execute(
+            "INSERT OR REPLACE INTO catalog_revision (table_name, hash, changed_at) "
+            "VALUES (?, ?, ?)",
+            (table_name, new_hash, datetime.now().isoformat()),
+        )
     
     conn.commit()
     conn.close()
@@ -461,6 +517,7 @@ def clear_platform_db(db_path: Path, platform: str) -> None:
     cursor = conn.cursor()
     cursor.execute(f"DELETE FROM {table_name}")
     cursor.execute("DELETE FROM versions WHERE platform = ?", (platform,))
+    cursor.execute("DELETE FROM catalog_revision WHERE table_name = ?", (table_name,))
     conn.commit()
     conn.close()
     logger.info(f"DB cleared: {platform}")
@@ -486,3 +543,33 @@ def get_game_files(db_path: Path, table_name: str) -> list:
     results = cursor.fetchall()
     conn.close()
     return results
+
+
+def get_revision(db_path: Path, platform: str) -> Optional[Tuple[str, datetime]]:
+    """Get the catalog revision of a platform.
+
+    Args:
+        db_path: Path to the SQLite database.
+        platform: Platform key (e.g. ``"global-android"``).
+
+    Returns:
+        ``(hash, changed_at)``, or None if no catalog has been stored yet.
+        Compare ``hash`` with the value saved earlier to detect a change.
+
+    Raises:
+        ValueError: If the platform is unknown.
+    """
+    table_name = get_table_name(platform)
+    if not table_name:
+        raise ValueError(f"Unknown platform: {platform}")
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT hash, changed_at FROM catalog_revision WHERE table_name = ?",
+        (table_name,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return row[0], datetime.fromisoformat(row[1])

@@ -229,6 +229,23 @@ client.clean(platform=('japan-android', 'japan-windows'))
 
 Without `server`, bulk methods accept `all`, one legacy composite, or a list/tuple of legacy composites. Lists and tuples preserve first-seen order and remove duplicates; an empty list or tuple is a no-op. They cannot be combined with `server`, and `all` cannot appear inside a list or tuple. With `server`, use a single bare platform value. `server='all'` or `platform='all'` expands the supported matrix in its documented order. An unsupported selection such as Global Windows raises `ValueError` before catalog or cache actions.
 
+### `get_revision` — detect catalog changes
+
+`get_revision(target)` returns `(hash, changed_at)` for one composite target, or `None` if no catalog has been stored yet. `hash` is a sha256 fingerprint of the stored catalog; save it when you read the catalog, and a different value on a later call means the catalog changed since. This also catches same-version changes such as hotfix bundles, which `version` alone does not show.
+
+```python
+rev = client.get_revision('global-ios')
+if rev is not None:
+    saved_hash, changed_at = rev
+
+# later: refresh, then compare
+client.update(server=Server.GLOBAL, platform=Platform.IOS)
+if client.get_revision('global-ios')[0] != saved_hash:
+    ...  # catalog changed since the last read
+```
+
+Compare `hash` only; `changed_at` is when this database last saw the content change and is informational. File order and hash-letter casing do not affect the fingerprint. `clean()` removes the revision; refetching identical content later gives the same `hash`. Call `update()` (or `query()`, which refreshes when due) first, since `get_revision` reads the stored value and does not fetch.
+
 ### Option enums
 
 All enums are `StrEnum`s, so each member compares equal to its string value. Import them from `bagfd.enums`.
@@ -246,7 +263,7 @@ The data directory defaults to `platformdirs.user_data_dir("BAGFD")`, or can be 
 
 | Location | Holds |
 |---|---|
-| `data_dir/catalog.db` | file catalogs and version records, keyed by composite target |
+| `data_dir/catalog.db` | file catalogs, version records and catalog revisions, keyed by composite target |
 | `data_dir/zip_cache/<target>/` | cached Japan ZIP packs, including Japan iOS |
 | `data_dir/download_cache/<target>/<file path>` | files returned by `get_latest_files`, preserving the catalog or ZIP member path |
 | `./download` (or `output_dir`) | files delivered by `download` |

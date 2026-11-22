@@ -32,6 +32,7 @@ import logging
 import os
 import threading
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -41,6 +42,7 @@ from .database import (
     clear_cache_for_platform,
     clear_platform_db,
     get_game_files,
+    get_revision,
     get_table_name,
     init_database,
     prune_stale_cache,
@@ -587,6 +589,18 @@ class BlueArchiveGameFilesDownloader:
         for p in self._resolve_platforms(platform, server=server):
             if self._fetch_platform(p, force):
                 self._prune_stale_cache(p, cache_dir)
+
+    def get_revision(self, target: str) -> tuple[str, datetime] | None:
+        """Return the stored catalog revision of ``target``.
+
+        Save the returned ``hash`` when you read the catalog; if a later call
+        returns a different ``hash``, the catalog has changed since. ``changed_at``
+        is when this client's database last saw the content change.
+
+        Returns:
+            ``(hash, changed_at)``, or None if no catalog has been stored yet.
+        """
+        return get_revision(self.db_path, self._validate_composite_target(target))
 
     def clean(
         self,

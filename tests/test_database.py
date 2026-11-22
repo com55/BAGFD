@@ -8,7 +8,9 @@ import pytest
 
 from bagfd.database import (
     clear_defer,
+    clear_platform_db,
     get_game_files,
+    get_revision,
     get_table_name,
     get_stored_version,
     init_database,
@@ -176,13 +178,17 @@ class TestDatabasePragmasAndSchema:
             "INSERT INTO japan_api_cache (id, version, api_url) VALUES (1, ?, ?)",
             ("1.2.3", "https://api.example"),
         )
+        # Seed rows with plain SQL: a genuinely old database has no
+        # catalog_revision table, which save_game_files now writes to.
+        for platform in old_platforms:
+            conn.execute(
+                f"INSERT INTO {get_table_name(platform)} "
+                "(path, url, hash_type, hash_value, size, bundle_files) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (f"{platform}/a.bundle", "https://cdn/a", "md5", platform, 10, None),
+            )
         conn.commit()
         conn.close()
-
-        for platform in old_platforms:
-            save_game_files(db, get_table_name(platform), [
-                (f"{platform}/a.bundle", "https://cdn/a", "md5", platform, 10, None),
-            ])
 
         conn = sqlite3.connect(db)
         old_schema = {
@@ -387,3 +393,86 @@ class TestDeferMigration:
         cols = {c[1] for c in conn.execute("PRAGMA table_info(versions)").fetchall()}
         conn.close()
         assert "defer_until" in cols
+
+
+# ---------------------------------------------------------------------------
+# catalog revision
+# ---------------------------------------------------------------------------
+
+ROW_A = ("Android/a.bundle", "https://cdn/a", "md5", "AB12", 10, None)
+ROW_B = ("Android/b.bundle", "https://cdn/b", "md5", "cd34", 20, None)
+
+
+class TestCatalogRevision:
+    def test_none_before_any_catalog(self, tmp_path):
+        db = tmp_path / "r.db"
+        init_database(db)
+        assert get_revision(db, "global-android") is None
+
+    def test_unknown_platform_raises(self, tmp_path):
+        db = tmp_path / "r.db"
+        init_database(db)
+        with pytest.raises(ValueError):
+            get_revision(db, "nope")
+
+    def test_save_sets_revision(self, tmp_path):
+        db = tmp_path / "r.db"
+        init_database(db)
+        save_game_files(db, "global_android", [ROW_A])
+        digest, changed_at = get_revision(db, "global-android")
+        assert len(digest) == 64
+        assert isinstance(changed_at, datetime)
+
+    def test_content_change_changes_hash(self, tmp_path):
+        db = tmp_path / "r.db"
+        init_database(db)
+        save_game_files(db, "global_android", [ROW_A])
+        first = get_revision(db, "global-android")[0]
+        save_game_files(db, "global_android", [ROW_A, ROW_B])
+        assert get_revision(db, "global-android")[0] != first
+
+    def test_same_content_keeps_hash_and_changed_at(self, tmp_path):
+        db = tmp_path / "r.db"
+        init_database(db)
+        save_game_files(db, "global_android", [ROW_A, ROW_B])
+        first = get_revision(db, "global-android")
+        # different order + hash casing only: not a change
+        save_game_files(db, "global_android", [
+            ROW_B[:3] + (ROW_B[3].upper(),) + ROW_B[4:],
+            ROW_A[:3] + (ROW_A[3].lower(),) + ROW_A[4:],
+        ])
+        assert get_revision(db, "global-android") == first
+
+    def test_platforms_are_independent(self, tmp_path):
+        db = tmp_path / "r.db"
+        init_database(db)
+        save_game_files(db, "global_android", [ROW_A])
+        assert get_revision(db, "global-ios") is None
+
+    def test_clear_platform_db_removes_revision(self, tmp_path):
+        db = tmp_path / "r.db"
+        init_database(db)
+        save_game_files(db, "global_android", [ROW_A])
+        clear_platform_db(db, "global-android")
+        assert get_revision(db, "global-android") is None
+
+    def test_refetch_same_content_after_clear_gives_same_hash(self, tmp_path):
+        db = tmp_path / "r.db"
+        init_database(db)
+        save_game_files(db, "global_android", [ROW_A])
+        first = get_revision(db, "global-android")[0]
+        clear_platform_db(db, "global-android")
+        save_game_files(db, "global_android", [ROW_A])
+        assert get_revision(db, "global-android")[0] == first
+
+    def test_init_backfills_preexisting_catalog(self, tmp_path):
+        db = tmp_path / "r.db"
+        init_database(db)
+        save_game_files(db, "global_android", [ROW_A])
+        expected = get_revision(db, "global-android")[0]
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE catalog_revision")
+        conn.commit()
+        conn.close()
+        init_database(db)
+        assert get_revision(db, "global-android")[0] == expected
