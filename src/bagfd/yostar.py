@@ -10,11 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import struct
+import tempfile
 import time
-from io import BytesIO
-from typing import Any
+from contextlib import closing
+from pathlib import Path
+from typing import IO, Any
 from urllib.parse import quote
 
 import requests
@@ -45,6 +48,51 @@ _XAPK_URL_RE = re.compile(
     r"(X?APKJ)..(https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}"
     r"\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*))"
 )
+
+
+_CHUNK_SIZE = 64 * 1024
+_GAME_CONFIG_MARKER = b"GameMainConfig\x00\x00"
+
+
+def _default_temp_dir() -> Path:
+    """``tmp`` under the default data directory, for callers that pass none.
+
+    The OS temp directory is avoided because it may be RAM-backed (tmpfs).
+    """
+    env = os.environ.get("BAGFD_DATA_DIR")
+    if env:
+        return Path(env) / "tmp"
+    from platformdirs import user_data_dir
+
+    return Path(user_data_dir("BAGFD")) / "tmp"
+
+
+def _download_to_file(
+    session: requests.Session, url: str, dest: IO[bytes], digest: Any = None,
+) -> None:
+    """Stream ``url`` into ``dest`` in chunks, optionally updating ``digest``."""
+    with closing(session.get(url, stream=True)) as resp:
+        resp.raise_for_status()
+        for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
+            dest.write(chunk)
+            if digest is not None:
+                digest.update(chunk)
+
+
+def _find_in_file(f: IO[bytes], needle: bytes) -> int:
+    """Chunked ``bytes.find`` over a whole file; return the offset or -1."""
+    f.seek(0)
+    tail = b""
+    window_start = 0
+    while chunk := f.read(_CHUNK_SIZE):
+        window = tail + chunk
+        pos = window.find(needle)
+        if pos >= 0:
+            return window_start + pos
+        # Carry enough bytes to catch a needle straddling two chunks.
+        tail = window[-(len(needle) - 1):]
+        window_start += len(window) - len(tail)
+    return -1
 
 
 def _md5_hex(text: str) -> str:
@@ -178,7 +226,32 @@ def extract_game_main_from_resources(blob: bytes) -> str:
     return _decrypt_game_main_payload(blob[data_start: data_start + size])
 
 
-def _japan_api_url_from_launcher(session: requests.Session) -> tuple[str, str]:
+def _extract_game_main_from_file(f: IO[bytes]) -> str:
+    """File-based `extract_game_main_from_resources`, reading only the payload."""
+    # The full pattern wins even if a bare marker appears earlier in the file.
+    pos = _find_in_file(f, GAME_CONFIG_PATTERN)
+    if pos < 0:
+        pos = _find_in_file(f, _GAME_CONFIG_MARKER)
+    if pos < 0:
+        raise ValueError("GameMainConfig pattern not found in resources.assets")
+
+    file_size = f.seek(0, os.SEEK_END)
+    size_offset = pos + len(_GAME_CONFIG_MARKER)
+    data_start = size_offset + 4
+    if data_start > file_size:
+        raise ValueError("GameMainConfig payload size out of range")
+    f.seek(size_offset)
+    size = struct.unpack("<i", f.read(4))[0]
+    if size <= 0 or data_start + size > file_size:
+        raise ValueError("GameMainConfig payload size out of range")
+
+    f.seek(data_start)
+    return _decrypt_game_main_payload(f.read(size))
+
+
+def _japan_api_url_from_launcher(
+    session: requests.Session, temp_dir: Path,
+) -> tuple[str, str]:
     """Return (version, server_info_url) via YoStar launcher + resources.assets."""
     base = get_yostar_base_config(session)
     version = base["game_latest_version"]
@@ -189,29 +262,33 @@ def _japan_api_url_from_launcher(session: requests.Session) -> tuple[str, str]:
         "Downloading resources.assets (%s bytes expected)...",
         file_info.get("size", "?"),
     )
-    resp = session.get(download_url, stream=True)
-    resp.raise_for_status()
-    blob = resp.content
-
     expected_hash = (file_info.get("hash") or "").strip().lower()
     # YoStar currently returns a decimal CRC64-like value, not an MD5 hex digest.
     # Only verify when the catalog gives a classic 32-char hex MD5.
+    digest = None
     if len(expected_hash) == 32 and all(c in "0123456789abcdef" for c in expected_hash):
-        actual = hashlib.md5(blob).hexdigest()
-        if actual != expected_hash:
-            raise ValueError(
-                f"resources.assets hash mismatch: expected {expected_hash}, got {actual}"
-            )
+        digest = hashlib.md5()
     elif expected_hash:
         logger.debug(
             "Skipping resources.assets hash verify (non-MD5 hash=%s)", expected_hash
         )
 
-    api_url = extract_game_main_from_resources(blob)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile(dir=temp_dir) as asset:
+        _download_to_file(session, download_url, asset, digest)
+        if digest is not None:
+            actual = digest.hexdigest()
+            if actual != expected_hash:
+                raise ValueError(
+                    f"resources.assets hash mismatch: expected {expected_hash}, got {actual}"
+                )
+        api_url = _extract_game_main_from_file(asset)
     return version, api_url
 
 
-def _japan_api_url_from_xapk(session: requests.Session) -> tuple[str, str]:
+def _japan_api_url_from_xapk(
+    session: requests.Session, temp_dir: Path,
+) -> tuple[str, str]:
     """Legacy fallback: PureAPK version + XAPK GameMainConfig extract."""
     from .fetchers import _extract_japan_api_url
 
@@ -230,15 +307,24 @@ def _japan_api_url_from_xapk(session: requests.Session) -> tuple[str, str]:
 
     download_url = url_match.group(2)
     logger.info("Downloading Japan XAPK...")
-    xapk_data = BytesIO(session.get(download_url, stream=True).content)
-    api_url = _extract_japan_api_url(session, xapk_data)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile(dir=temp_dir) as xapk_file:
+        _download_to_file(session, download_url, xapk_file)
+        api_url = _extract_japan_api_url(session, xapk_file, temp_dir)
     return version, api_url
 
 
-def resolve_japan_server_info_url(session: requests.Session) -> tuple[str, str]:
-    """Resolve (version, ServerInfoDataUrl), preferring launcher over XAPK."""
+def resolve_japan_server_info_url(
+    session: requests.Session, *, temp_dir: Path | None = None,
+) -> tuple[str, str]:
+    """Resolve (version, ServerInfoDataUrl), preferring launcher over XAPK.
+
+    Downloads are buffered in temporary files under ``temp_dir`` (default:
+    ``tmp`` inside the default data directory), which should be disk-backed.
+    """
+    temp_dir = Path(temp_dir) if temp_dir is not None else _default_temp_dir()
     try:
-        return _japan_api_url_from_launcher(session)
+        return _japan_api_url_from_launcher(session, temp_dir)
     except Exception as exc:
         logger.warning("YoStar launcher path failed (%s); trying XAPK fallback", exc)
-        return _japan_api_url_from_xapk(session)
+        return _japan_api_url_from_xapk(session, temp_dir)

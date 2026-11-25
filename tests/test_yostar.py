@@ -17,7 +17,7 @@ def _ok(json_data=None, content=None, text=None):
     if json_data is not None:
         resp.json.return_value = json_data
     if content is not None:
-        resp.content = content
+        resp.iter_content.return_value = [content]
     if text is not None:
         resp.text = text
     return resp
@@ -91,7 +91,7 @@ class TestExtractGameMainFromResources:
 
 
 class TestResolveJapanServerInfoUrl:
-    def test_launcher_path_skips_xapk(self):
+    def test_launcher_path_skips_xapk(self, tmp_path):
         resources_blob = _build_resources_asset(
             _server_info_config("https://from-launcher/api")
         )
@@ -134,13 +134,13 @@ class TestResolveJapanServerInfoUrl:
         session.get.side_effect = get_side
 
         with patch("bagfd.yostar._japan_api_url_from_xapk") as xapk:
-            version, api_url = resolve_japan_server_info_url(session)
+            version, api_url = resolve_japan_server_info_url(session, temp_dir=tmp_path)
             xapk.assert_not_called()
 
         assert version == "1.71.1"
         assert api_url == "https://from-launcher/api"
 
-    def test_falls_back_to_xapk_when_launcher_fails(self):
+    def test_falls_back_to_xapk_when_launcher_fails(self, tmp_path):
         session = MagicMock()
         session.get.side_effect = Exception("launcher down")
 
@@ -148,7 +148,7 @@ class TestResolveJapanServerInfoUrl:
             "bagfd.yostar._japan_api_url_from_xapk",
             return_value=("1.70.0", "https://from-xapk/api"),
         ) as xapk:
-            version, api_url = resolve_japan_server_info_url(session)
+            version, api_url = resolve_japan_server_info_url(session, temp_dir=tmp_path)
             xapk.assert_called_once()
 
         assert version == "1.70.0"

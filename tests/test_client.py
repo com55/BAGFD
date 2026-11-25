@@ -436,6 +436,7 @@ class TestSplitClientApi:
 
         fetch.assert_called_once_with(
             client.session, client.db_path, False, requested_targets=['japan-ios'],
+            temp_dir=client.data_dir / 'tmp',
         )
         assert [result.name for result in results] == ['iOS/ch0230_ios.bundle']
         assert get_game_files(client.db_path, get_table_name('japan-android')) == android_before
@@ -699,7 +700,7 @@ class TestQueryUpdateBackground:
             assert release_global.wait(timeout=2)
             return False
 
-        def quick_japan(session, db_path, force=False, check_interval=None, *, requested_targets):
+        def quick_japan(session, db_path, force=False, check_interval=None, *, requested_targets, temp_dir):
             assert requested_targets == ['japan-ios']
             japan_finished.set()
             return {'japan-ios': False}
@@ -934,7 +935,7 @@ class TestUpdatePrunesCache:
         (extracted_dir / "Android").mkdir(parents=True)
         (extracted_dir / "Android" / "member.bundle").write_bytes(b"whatever")
 
-        def fake_fetch(session, db_path, force=False, check_interval=None, *, requested_targets):
+        def fake_fetch(session, db_path, force=False, check_interval=None, *, requested_targets, temp_dir):
             assert requested_targets == ['japan-android']
             save_game_files(db_path, get_table_name("japan-android"), [
                 ("Pack_keep.zip", "https://jp/Pack_keep.zip", "crc32",

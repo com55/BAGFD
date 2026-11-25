@@ -5,11 +5,12 @@ Platform-specific fetching logic for Blue Archive game files.
 import logging
 import json
 import re
+import shutil
+import tempfile
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Tuple
-from io import BytesIO
+from typing import IO, Dict, Tuple
 from urllib.parse import urljoin
 import requests
 
@@ -84,7 +85,34 @@ def _decrypt_japan_config(encrypted_data: bytes) -> str:
     return result
 
 
-def _extract_japan_api_url(session: requests.Session, xapk_data: BytesIO) -> str:
+_CHUNK_SIZE = 64 * 1024
+
+
+def _read_after_marker(stream: IO[bytes], marker: bytes, length: int) -> bytes | None:
+    """Return up to ``length`` bytes following the first ``marker`` in ``stream``.
+
+    Always reads to EOF, so a zip member's CRC is verified before the result
+    is used. Returns None if the marker is absent.
+    """
+    found = None
+    tail = b""
+    while chunk := stream.read(_CHUNK_SIZE):
+        if found is None:
+            window = tail + chunk
+            pos = window.find(marker)
+            if pos >= 0:
+                start = pos + len(marker)
+                found = window[start:start + length]
+            else:
+                tail = window[-(len(marker) - 1):]
+        elif len(found) < length:
+            found += chunk[:length - len(found)]
+    return found
+
+
+def _extract_japan_api_url(
+    session: requests.Session, xapk_data: IO[bytes], temp_dir: Path,
+) -> str:
     """Extract API URL from Japan XAPK.
     
     Extracts the game configuration from the XAPK file and decrypts it
@@ -92,7 +120,8 @@ def _extract_japan_api_url(session: requests.Session, xapk_data: BytesIO) -> str
     
     Args:
         session: Requests session for HTTP operations.
-        xapk_data: BytesIO containing XAPK file data.
+        xapk_data: Seekable binary file containing XAPK data.
+        temp_dir: Disk-backed directory for the unpacked nested APK.
         
     Returns:
         Decrypted server API URL.
@@ -103,18 +132,19 @@ def _extract_japan_api_url(session: requests.Session, xapk_data: BytesIO) -> str
     config_pattern = bytes([0x47, 0x61, 0x6D, 0x65, 0x4D, 0x61, 0x69, 0x6E, 0x43, 0x6F, 0x6E, 0x66, 0x69, 0x67,
                            0x00, 0x00, 0x92, 0x03, 0x00, 0x00])
     
-    with zipfile.ZipFile(xapk_data, 'r') as xapk:
-        unity_apk_data = xapk.read('UnityDataAssetPack.apk')
-        
-        with zipfile.ZipFile(BytesIO(unity_apk_data), 'r') as unity_apk:
+    with zipfile.ZipFile(xapk_data, 'r') as xapk, \
+            tempfile.TemporaryFile(dir=temp_dir) as apk_file:
+        # ZipFile needs to seek, so unpack the nested APK to disk first.
+        with xapk.open('UnityDataAssetPack.apk') as src:
+            shutil.copyfileobj(src, apk_file, _CHUNK_SIZE)
+
+        with zipfile.ZipFile(apk_file, 'r') as unity_apk:
             for filename in unity_apk.namelist():
                 if 'assets/bin/Data/' in filename and not filename.endswith('/'):
-                    data = unity_apk.read(filename)
-                    offset = data.find(config_pattern)
-                    
-                    if offset != -1:
-                        data_start = offset + len(config_pattern)
-                        encrypted_data = data[data_start:data_start + 1024]
+                    with unity_apk.open(filename) as member:
+                        encrypted_data = _read_after_marker(member, config_pattern, 1024)
+
+                    if encrypted_data is not None:
                         return _decrypt_japan_config(encrypted_data)
     
     raise ValueError("Could not find game config")
@@ -419,12 +449,16 @@ def _defer_japan_failures(
 def fetch_japan_servers(session: requests.Session, db_path: Path,
                        force: bool = False, check_interval=None,
                        defer_on_failure: timedelta = timedelta(minutes=10),
-                       *, requested_targets=None) -> Dict[str, bool]:
+                       *, requested_targets=None,
+                       temp_dir: Path | None = None) -> Dict[str, bool]:
     """Fetch due requested Japan catalogs; defaults to Android and Windows.
 
     Each target's complete pack catalog is validated before its rows or version
     are updated. Cached failures are deferred independently; first-fetch
     failures raise :class:`ResourceUnavailableError` after other targets finish.
+
+    ``temp_dir`` is the disk-backed directory for bootstrap downloads (default:
+    ``tmp`` inside the default data directory).
     """
     targets = _select_japan_targets(requested_targets)
     if not targets:
@@ -463,7 +497,9 @@ def fetch_japan_servers(session: requests.Session, db_path: Path,
                 "Resolving Japan server info "
                 "(YoStar resources.assets, XAPK fallback)..."
             )
-            current_version, resolved_api_url = resolve_japan_server_info_url(session)
+            current_version, resolved_api_url = resolve_japan_server_info_url(
+                session, temp_dir=temp_dir,
+            )
             if not isinstance(current_version, str) or not current_version:
                 raise ValueError("Japan server-info version is invalid")
             if not isinstance(resolved_api_url, str) or not resolved_api_url:
@@ -493,7 +529,9 @@ def fetch_japan_servers(session: requests.Session, db_path: Path,
                     "Version changed %s → %s; refreshing server info...",
                     cached[0], current_version,
                 )
-                current_version, resolved_api_url = resolve_japan_server_info_url(session)
+                current_version, resolved_api_url = resolve_japan_server_info_url(
+                    session, temp_dir=temp_dir,
+                )
                 if not isinstance(current_version, str) or not current_version:
                     raise ValueError("Japan server-info version is invalid")
                 if not isinstance(resolved_api_url, str) or not resolved_api_url:
@@ -505,7 +543,8 @@ def fetch_japan_servers(session: requests.Session, db_path: Path,
         if not isinstance(resolved_api_url, str) or not resolved_api_url:
             raise ValueError("Japan server-info URL is invalid")
 
-    except _YOSTAR_FETCH_ERRORS as exc:
+    # OSError: bootstrap downloads use temp files (disk full, unwritable dir).
+    except (*_YOSTAR_FETCH_ERRORS, OSError) as exc:
         bootstrap_error = exc
 
     if cache_update is not None:

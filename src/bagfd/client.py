@@ -16,6 +16,7 @@ an optionally overridden catalog DB):
 - ``data_dir/catalog.db``       — the file catalog (path overridable via ``db_path``,
                                   e.g. to keep it off shared/network-backed storage)
 - ``data_dir/zip_cache/<plat>`` — cached JP zip packs (shared by download/get)
+- ``data_dir/tmp``              — temporary files for the JP bootstrap downloads
 - ``cache_dir/<plat>/<path>``   — files returned by `get_latest_files`, using
                                   catalog or ZIP member paths (default
                                   ``data_dir/download_cache``)
@@ -30,7 +31,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import threading
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +66,22 @@ from .targets import SUPPORTED_TARGETS, normalize_target, resolve_targets, split
 logger = logging.getLogger(__name__)
 
 _ALL_PLATFORMS = SUPPORTED_TARGETS
+
+
+def _extract_member(zf: zipfile.ZipFile, member: str, target: Path) -> None:
+    """Extract ``member`` to ``target`` in chunks, replacing it only on success."""
+    # Resolved so that a symlinked target is written through, not replaced.
+    dest = target.resolve()
+    # Created with open() rather than mkstemp() to keep umask-based permissions.
+    temp = dest.parent / f".bagfd-{uuid.uuid4().hex}.part"
+    try:
+        with zf.open(member) as src, open(temp, 'xb') as dst:
+            shutil.copyfileobj(src, dst, 64 * 1024)
+        if dest.exists():
+            shutil.copymode(dest, temp)
+        os.replace(temp, dest)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 class BlueArchiveGameFilesDownloader:
@@ -663,6 +682,7 @@ class BlueArchiveGameFilesDownloader:
             return fetch_global(self.session, self.db_path, force, target=platform)
         results = fetch_japan_servers(
             self.session, self.db_path, force, requested_targets=[platform],
+            temp_dir=self.data_dir / "tmp",
         )
         return bool(results.get(platform))
 
@@ -858,7 +878,6 @@ class BlueArchiveGameFilesDownloader:
                         delivered.append(target)
                         continue
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(member) as src, open(target, 'wb') as dst:
-                        dst.write(src.read())
+                    _extract_member(zf, member, target)
                     delivered.append(target)
         return delivered
