@@ -464,7 +464,9 @@ def fetch_japan_servers(session: requests.Session, db_path: Path,
     if not targets:
         return {}
 
-    from .yostar import get_yostar_base_config, resolve_japan_server_info_url
+    from .yostar import (
+        get_yostar_base_config, japan_build_version, resolve_japan_server_info_url,
+    )
 
     if check_interval is None:
         check_interval = timedelta(hours=4)
@@ -513,7 +515,7 @@ def fetch_japan_servers(session: requests.Session, db_path: Path,
                 discovered_version = base_config.get("game_latest_version")
                 if not isinstance(discovered_version, str) or not discovered_version:
                     raise ValueError("YoStar base config has an invalid version")
-                current_version = discovered_version
+                current_version = japan_build_version(base_config)
             except _YOSTAR_FETCH_ERRORS as exc:
                 logger.warning(
                     "YoStar version check failed (%s); using cached version %s",

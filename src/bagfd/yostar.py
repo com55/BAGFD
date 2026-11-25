@@ -128,6 +128,23 @@ def get_yostar_base_config(session: requests.Session) -> dict:
     return data
 
 
+def japan_build_version(base_config: dict) -> str:
+    """Return the full game version, e.g. ``1.75.479435``.
+
+    ``game_latest_version`` is the launcher's short form (``1.75.0``). The full
+    version, which matches the mobile app, appears only in the package filename.
+    Falls back to the short form if that filename has no version with the same
+    major and minor parts.
+    """
+    short = base_config["game_latest_version"]
+    path = base_config.get("game_latest_file_path")
+    if isinstance(path, str):
+        match = _VERSION_RE.search(path.rsplit("/", 1)[-1])
+        if match and list(match.group(1, 2)) == short.split(".")[:2]:
+            return match.group(0)
+    return short
+
+
 def get_resources_asset_url(session: requests.Session, base_config: dict) -> tuple[str, dict]:
     """Resolve the CDN URL and file info for resources.assets."""
     domain = _yostar_request(session, YOSTAR_DOMAIN_PATH)
@@ -254,7 +271,7 @@ def _japan_api_url_from_launcher(
 ) -> tuple[str, str]:
     """Return (version, server_info_url) via YoStar launcher + resources.assets."""
     base = get_yostar_base_config(session)
-    version = base["game_latest_version"]
+    version = japan_build_version(base)
     logger.info("YoStar JP version: %s", version)
 
     download_url, file_info = get_resources_asset_url(session, base)

@@ -1,12 +1,16 @@
 """Tests for Japan YoStar launcher → resources.assets config resolution."""
 import struct
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from bagfd.crypto import create_key, encrypt_string, xor_inplace
+from bagfd.database import get_stored_version, init_database
+from bagfd.fetchers import fetch_japan_servers
 from bagfd.yostar import (
     extract_game_main_from_resources,
+    japan_build_version,
     resolve_japan_server_info_url,
 )
 
@@ -153,3 +157,105 @@ class TestResolveJapanServerInfoUrl:
 
         assert version == "1.70.0"
         assert api_url == "https://from-xapk/api"
+
+
+_BASE_CONFIG = {
+    "game_latest_version": "1.75.0",
+    "game_latest_file_path": "prod/ZIP_TEMP/Game_TEMP/Game-1.75.479435-game.zip",
+}
+
+
+class TestJapanBuildVersion:
+    def test_reads_full_version_from_package_filename(self):
+        assert japan_build_version(_BASE_CONFIG) == "1.75.479435"
+
+    @pytest.mark.parametrize("path", [
+        None,
+        123,
+        "",
+        "prod/Game-game.zip",
+        "prod/1.75.479435/Game-game.zip",  # only the filename counts
+        "prod/Game-1.74.471552-game.zip",  # different minor
+        "prod/Game-2.75.479435-game.zip",  # different major
+    ])
+    def test_falls_back_to_short_version(self, path):
+        base = {**_BASE_CONFIG, "game_latest_file_path": path}
+        assert japan_build_version(base) == "1.75.0"
+
+    def test_missing_path_key(self):
+        assert japan_build_version({"game_latest_version": "1.75.0"}) == "1.75.0"
+
+    def test_launcher_reports_full_version_but_requests_short_one(self, tmp_path):
+        urls = []
+
+        def get(url, *args, **kwargs):
+            urls.append(url)
+            if url.endswith("/api/launcher/game/config"):
+                return _ok({"code": 200, "data": _BASE_CONFIG})
+            if "download/cdn" in url:
+                return _ok({"code": 200, "data": {"primary_cdn": "https://cdn.example/"}})
+            if "/api/launcher/game/config/json" in url:
+                return _ok({"code": 200, "data": {"url": "https://cdn.example/list.json"}})
+            if url.endswith("list.json"):
+                return _ok({"source": "", "file": [{"path": "x/resources.assets"}]})
+            return _ok(content=_build_resources_asset(
+                _server_info_config("https://from-launcher/api")
+            ))
+
+        session = MagicMock()
+        session.get.side_effect = get
+
+        version, _url = resolve_japan_server_info_url(session, temp_dir=tmp_path)
+
+        assert version == "1.75.479435"
+        [json_config_url] = [u for u in urls if "/game/config/json" in u]
+        assert "version=1.75.0&" in json_config_url
+
+
+def _japan_catalog_session():
+    addressables = {"ConnectionGroups": [{"OverrideConnectionGroups": [
+        {}, {"AddressablesCatalogUrlRoot": "https://cdn.example/root"},
+    ]}]}
+    bundles = {"UpdatePacks": [], "FullPatchPacks": [{
+        "PackName": "a.zip", "Crc": 1, "PackSize": 1, "BundleFiles": [{"Name": "x"}],
+    }]}
+    session = MagicMock()
+    session.get.side_effect = lambda url, **kwargs: _ok(
+        addressables if url == "https://api.example" else bundles
+    )
+    return session
+
+
+class TestApiUrlCacheAcrossSources:
+    """The launcher and XAPK paths must agree on the cached version."""
+
+    @pytest.mark.parametrize("launcher_failures", [
+        [ValueError("down once")],
+        [ValueError("always down")] * 3,
+    ])
+    def test_xapk_result_is_reused(self, tmp_path, launcher_failures):
+        db = tmp_path / "catalog.db"
+        init_database(db)
+
+        with patch("bagfd.yostar.get_yostar_base_config", return_value=_BASE_CONFIG), \
+                patch(
+                    "bagfd.yostar._japan_api_url_from_launcher",
+                    side_effect=launcher_failures,
+                ) as launcher, \
+                patch(
+                    "bagfd.yostar._japan_api_url_from_xapk",
+                    return_value=("1.75.479435", "https://api.example"),
+                ) as xapk:
+            changes = [
+                fetch_japan_servers(
+                    _japan_catalog_session(), db,
+                    check_interval=timedelta(seconds=-1),
+                    requested_targets=["japan-android"], temp_dir=tmp_path,
+                )["japan-android"]
+                for _ in range(3)
+            ]
+
+        assert launcher.call_count == 1
+        assert xapk.call_count == 1
+        assert changes == [True, False, False]
+        assert get_stored_version(db, "japan-android") == "1.75.479435"
